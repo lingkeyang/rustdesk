@@ -40,9 +40,7 @@ class ConnectStatus: Reactor.Component {
     }
 
     event click $(.connect-status .link) () {
-        var options = handler.get_options();
-        options["stop-service"] = "";
-        handler.set_options(options);
+    	handler.set_option("stop-service", "");
     }
 }
 
@@ -64,13 +62,14 @@ class RecentSessions: Reactor.Component {
         var username = s[1];
         var hostname = s[2];
         var platform = s[3];
+        var alias = s[4];
         return <div .remote-session id={id} platform={platform} style={"background:"+string2RGB(id+platform, 0.5)}>
             <div .platform>
                 {platformSvg(platform, "white")}
                 <div .username>{username}@{hostname}</div>
             </div>
             <div .text>
-                <div>{formatId(id)}</div>
+                <div #alias>{alias ? alias : formatId(id)}</div>
                 {svg_menu}
             </div>
         </div>;
@@ -103,10 +102,23 @@ event click $(menu#remote-context li) (evt, me) {
     } else if (action == "remove") {
         handler.remove_peer(id);
         app.recent_sessions.update();
+    } else if (action == "shortcut") {
+        handler.create_shortcut(id);
     } else if (action == "rdp") {
         createNewConnect(id, "rdp");
     } else if (action == "tunnel") {
         createNewConnect(id, "port-forward");
+    } else if (action == "rename") {
+        var old_name = handler.get_peer_option(id, "alias");
+        handler.msgbox("custom-rename", "Rename", "<div .form> \
+            <div><input name='name' style='width: *; height: 23px', value='" + old_name + "' /></div> \
+            </div> \
+            ", function(res=null) {
+                if (!res) return;
+                var name = (res.name || "").trim();
+                if (name != old_name) handler.set_peer_option(id, "alias", name);
+                self.select('#' + id).select('#alias').text = name || id;
+            });
     }
 }
 
@@ -115,7 +127,7 @@ function createNewConnect(id, type) {
     app.remote_id.value = formatId(id);
     if (!id) return;
     if (id == handler.get_id()) {
-        handler.msgbox("custom-error", "Error", "Sorry, it is yourself");
+        handler.msgbox("custom-error", "Error", "You cannot connect to your own computer");
         return;
     }
     handler.set_remote_id(id);
@@ -124,7 +136,6 @@ function createNewConnect(id, type) {
 
 var myIdMenu;
 var audioInputMenu;
-var configOptions = {};
 class AudioInputs: Reactor.Component {
     function this() {
         audioInputMenu = this;
@@ -153,7 +164,7 @@ class AudioInputs: Reactor.Component {
     }
 
     function get_value() {
-        return configOptions["audio-input"] || this.get_default();
+        return handler.get_option("audio-input") || this.get_default();
     }
 
     function toggleMenuState() {
@@ -168,8 +179,7 @@ class AudioInputs: Reactor.Component {
         var v = me.id;
         if (v == this.get_value()) return;
         if (v == this.get_default()) v = "";
-        configOptions["audio-input"] = v;
-        handler.set_options(configOptions);
+        handler.set_option("audio-input", v);
         this.toggleMenuState();
     }
 }
@@ -199,7 +209,7 @@ class MyIdMenu: Reactor.Component {
                 <li #whitelist title="Only whitelisted IP can access me">IP Whitelisting</li>
                 <li #custom-server>ID/Relay Server</li>
                 <div .separator />
-                <li #stop-service>{service_stopped ? "Start service" : "Stop service"}</li>
+                <li #stop-service class={service_stopped ? "line-through" : "selected"}><span>{svg_checkmark}</span>Enable service</li>
                 <div .separator />
                 <li #forum>Forum</li>
                 <li #about>About {handler.get_app_name()}</li>
@@ -209,7 +219,6 @@ class MyIdMenu: Reactor.Component {
 
     event click $(svg#menu) (_, me) {
         audioInputMenu.update({ show: true });
-        configOptions = handler.get_options();
         this.toggleMenuState();
         var menu = $(menu#config-options);
         me.popup(menu);
@@ -218,20 +227,19 @@ class MyIdMenu: Reactor.Component {
     function toggleMenuState() {
         for (var el in $$(menu#config-options>li)) {
             if (el.id && el.id.indexOf("enable-") == 0) {
-                var enabled = configOptions[el.id] != "N";
+                var enabled = handler.get_option(el.id) != "N";
                 el.attributes.toggleClass("selected", enabled);
+                el.attributes.toggleClass("line-through", !enabled);
             }
         }
     }
 
     event click $(menu#config-options>li) (_, me) {
         if (me.id && me.id.indexOf("enable-") == 0) {
-            configOptions[me.id] = configOptions[me.id] == "N" ? "" : "N";
-            handler.set_options(configOptions);
-            this.toggleMenuState();
+            handler.set_option(me.id, handler.get_option(me.id) == "N" ? "" : "N");
         }
         if (me.id == "whitelist") {
-            var old_value = (configOptions["whitelist"] || "").split(",").join("\n");
+            var old_value = handler.get_option("whitelist").split(",").join("\n");
             handler.msgbox("custom-whitelist", "IP Whitelisting", "<div .form> \
             <textarea spellcheck=\"false\" name=\"text\" novalue=\"0.0.0.0\" style=\"overflow: scroll-indicator; height: 160px; font-size: 1.2em; padding: 0.5em;\">" + old_value + "</textarea>\
             </div> \
@@ -239,7 +247,7 @@ class MyIdMenu: Reactor.Component {
                 if (!res) return;
                 var value = (res.text || "").trim();
                 if (value) {
-                    var values = value.split(/[\s,;]+/g);
+                    var values = value.split(/[\s,;\n]+/g);
                     for (var ip in values) {
                         if (!ip.match(/^\d+\.\d+\.\d+\.\d+$/)) {
                             return "Invalid ip: " + ip;
@@ -248,11 +256,11 @@ class MyIdMenu: Reactor.Component {
                     value = values.join("\n");
                 }
                 if (value == old_value) return;
-                configOptions["whitelist"] = value.replace("\n", ",");
                 stdout.println("whitelist updated");
-                handler.set_options(configOptions);
+                handler.set_option("whitelist", value.replace("\n", ","));
             }, 300);
         } else if (me.id == "custom-server") {
+        	var configOptions = handler.get_options();
             var old_relay = configOptions["relay-server"] || "";
             var old_id = configOptions["custom-rendezvous-server"] || "";
             handler.msgbox("custom-server", "ID/Relay Server", "<div .form> \
@@ -279,8 +287,7 @@ class MyIdMenu: Reactor.Component {
         } else if (me.id == "forum") {
             handler.open_url("https:://forum.rustdesk.com");
         } else if (me.id == "stop-service") {
-            configOptions["stop-service"] = service_stopped ? "" : "Y";
-            handler.set_options(configOptions);
+            handler.set_option("stop-service", service_stopped ? "" : "Y");
         } else if (me.id == "about") {
             var name = handler.get_app_name();
             handler.msgbox("custom-nocancel-nook-hasclose", "About " + name, "<div style='line-height: 2em'> \
@@ -310,6 +317,23 @@ class App: Reactor.Component
         var is_can_screen_recording = handler.is_can_screen_recording(false);
         return
             <div .app>
+              <popup>
+              <menu.context #remote-context>
+                <li #connect>Connect</li>
+                <li #transfer>Transfer File</li>
+                <li #tunnel>TCP Tunneling</li>
+                <li #rdp>RDP</li>
+                <li #rename>Rename</li>
+                <li #remove>Remove</li>
+                {is_win && <li #shortcut>Create Desktop Shortcut</li>}
+              </menu>
+              </popup>
+              <popup>
+              <menu.context #edit-password-context>
+                <li #refresh-password>Refresh random password</li>
+                <li #set-password>Set your own password</li>
+              </menu>
+              </popup>
                 <div .left-pane>
                     <div>
                         <div .title>Your Desktop</div>
@@ -329,7 +353,8 @@ class App: Reactor.Component
                     {is_can_screen_recording ? "": <CanScreenRecording />}
                     {is_can_screen_recording && !handler.is_process_trusted(false) ? <TrustMe /> : ""}
                     {system_error ? <SystemError /> : ""}
-                    {!system_error && handler.is_login_wayland() ? <FixWayland /> : ""}
+                    {!system_error && handler.is_login_wayland() && !handler.current_is_wayland() ? <FixWayland /> : ""}
+                    {!system_error && handler.current_is_wayland() ? <ModifyDefaultLogin /> : ""}
                 </div>
                 <div .right-pane>
                     <div .right-content>
@@ -421,7 +446,7 @@ class UpgradeMe: Reactor.Component {
         var update_or_download = is_osx ? "download" : "update";
         return <div .install-me>
             <div>{handler.get_app_name()} Status</div>
-            <div>Your installation is lower version.</div>
+            <div>An update is available for RustDesk.</div>
             <div #install-me .link style="padding-top: 1em">Click to upgrade</div>
         </div>;
     }
@@ -444,7 +469,7 @@ class UpdateMe: Reactor.Component {
 
     event click $(#install-me) {
         if (is_osx) {
-            handler.open_url("http://rustdesk.com");
+            handler.open_url("https://rustdesk.com");
             return;
         }
         var url = software_update_url + '.' + handler.get_software_ext();
@@ -519,6 +544,23 @@ class FixWayland: Reactor.Component {
 
     event click $(#fix-wayland) {
         handler.fix_login_wayland();
+        app.update();
+    }
+}
+
+class ModifyDefaultLogin: Reactor.Component {
+    function render() {
+        return <div .trust-me>
+            <div>Warning</div>
+            <div>Current Wayland display server is not supported</div>
+            <div #modify-default-login .link>Fix it(re-login required)</div>
+        </div>;
+    }
+
+    event click $(#modify-default-login) {
+        if (var r = handler.modify_default_login()) {
+            handler.msgbox("custom-error", "Error", r);
+        }
         app.update();
     }
 }
@@ -642,7 +684,8 @@ function formatId(id) {
 event keydown (evt) {
     if (!evt.shortcutKey) {
         if (evt.keyCode == Event.VK_ENTER ||
-            (view.mediaVar("platform") == "OSX" && evt.keyCode == 0x4C)) {
+            (is_osx && evt.keyCode == 0x4C) ||
+            (is_linux && evt.keyCode == 65421)) {
             var el = $(button#connect);
             view.focus = el;
             el.sendEvent("click");

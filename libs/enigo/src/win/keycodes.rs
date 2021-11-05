@@ -1,4 +1,7 @@
 // https://msdn.microsoft.com/en-us/library/windows/desktop/dd375731
+//
+// JP/KR mapping https://github.com/TigerVNC/tigervnc/blob/1a008c1380305648ab50f1d99e73439747e9d61d/vncviewer/win32.c#L267
+// altgr handle: https://github.com/TigerVNC/tigervnc/blob/dccb95f345f7a9c5aa785a19d1bfa3fdecd8f8e0/vncviewer/Viewport.cxx#L1066
 
 pub const EVK_RETURN: u16 = 0x0D;
 pub const EVK_TAB: u16 = 0x09;
@@ -7,9 +10,14 @@ pub const EVK_BACK: u16 = 0x08;
 pub const EVK_ESCAPE: u16 = 0x1b;
 pub const EVK_LWIN: u16 = 0x5b;
 pub const EVK_SHIFT: u16 = 0x10;
+//pub const EVK_LSHIFT: u16 = 0xa0;
+pub const EVK_RSHIFT: u16 = 0xa1;
+//pub const EVK_LMENU: u16 = 0xa4;
+pub const EVK_RMENU: u16 = 0xa5;
 pub const EVK_CAPITAL: u16 = 0x14;
 pub const EVK_MENU: u16 = 0x12;
 pub const EVK_LCONTROL: u16 = 0xa2;
+pub const EVK_RCONTROL: u16 = 0xa3;
 pub const EVK_HOME: u16 = 0x24;
 pub const EVK_PRIOR: u16 = 0x21;
 pub const EVK_NEXT: u16 = 0x22;

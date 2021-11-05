@@ -37,6 +37,12 @@ fn get_msgbox() -> String {
 }
 
 pub fn start(args: &mut [String]) {
+    // https://github.com/c-smile/sciter-sdk/blob/master/include/sciter-x-types.h
+    // https://github.com/rustdesk/rustdesk/issues/132#issuecomment-886069737
+    #[cfg(windows)]
+    allow_err!(sciter::set_options(sciter::RuntimeOptions::GfxLayer(
+        sciter::GFX_LAYER::WARP
+    )));
     #[cfg(windows)]
     if args.len() > 0 && args[0] == "--tray" {
         let mut res;
@@ -135,6 +141,7 @@ pub fn start(args: &mut [String]) {
 
 #[cfg(windows)]
 fn start_tray() -> hbb_common::ResultType<()> {
+    /*
     let mut app = systray::Application::new()?;
     let icon = include_bytes!("./tray-icon.ico");
     app.set_icon_from_buffer(icon, 32, 32).unwrap();
@@ -173,6 +180,7 @@ fn start_tray() -> hbb_common::ResultType<()> {
         Ok::<_, systray::Error>(())
     })?;
     allow_err!(app.wait_for_message());
+    */
     Ok(())
 }
 
@@ -266,6 +274,21 @@ impl UI {
         }
     }
 
+    fn get_peer_option(&self, id: String, name: String) -> String {
+        let c = PeerConfig::load(&id);
+        c.options.get(&name).unwrap_or(&"".to_owned()).to_owned()
+    }
+
+    fn set_peer_option(&self, id: String, name: String, value: String) {
+        let mut c = PeerConfig::load(&id);
+        if value.is_empty() {
+            c.options.remove(&name);
+        } else {
+            c.options.insert(name, value);
+        }
+        c.store(&id);
+    }
+
     fn get_options(&self) -> Value {
         let mut m = Value::map();
         for (k, v) in self.2.lock().unwrap().iter() {
@@ -310,7 +333,19 @@ impl UI {
                 }
             }
         }
+
+        *self.2.lock().unwrap() = m.clone();
         ipc::set_options(m).ok();
+    }
+
+    fn set_option(&self, key: String, value: String) {
+        let mut options = self.2.lock().unwrap();
+        if value.is_empty() {
+            options.remove(&key);
+        } else {
+            options.insert(key, value);
+        }
+        ipc::set_options(options.clone()).ok();
     }
 
     fn install_path(&mut self) -> String {
@@ -337,6 +372,7 @@ impl UI {
     }
 
     fn save_size(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        crate::server::input_service::fix_key_down_timeout_at_exit();
         Config::set_size(x, y, w, h);
     }
 
@@ -364,9 +400,13 @@ impl UI {
             .map(|p| {
                 let values = vec![
                     p.0.clone(),
-                    p.2.username.clone(),
-                    p.2.hostname.clone(),
-                    p.2.platform.clone(),
+                    p.2.info.username.clone(),
+                    p.2.info.hostname.clone(),
+                    p.2.info.platform.clone(),
+                    p.2.options
+                        .get("alias")
+                        .unwrap_or(&"".to_owned())
+                        .to_owned(),
                 ];
                 Value::from_iter(values)
             })
@@ -428,6 +468,9 @@ impl UI {
         #[cfg(target_os = "linux")]
         {
             let dtype = crate::platform::linux::get_display_server();
+            if "wayland" == dtype {
+                return "".to_owned();
+            }
             if dtype != "x11" {
                 return format!("Unsupported display server type {}, x11 expected!", dtype);
             }
@@ -445,6 +488,20 @@ impl UI {
     fn fix_login_wayland(&mut self) {
         #[cfg(target_os = "linux")]
         return crate::platform::linux::fix_login_wayland();
+    }
+    
+    fn current_is_wayland(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        return crate::platform::linux::current_is_wayland();
+        #[cfg(not(target_os = "linux"))]
+        return false;
+    }
+
+    fn modify_default_login(&mut self) -> String {
+        #[cfg(target_os = "linux")]
+        return crate::platform::linux::modify_default_login();
+        #[cfg(not(target_os = "linux"))]
+        return "".to_owned();
     }
 
     fn get_software_update_url(&self) -> String {
@@ -484,6 +541,11 @@ impl UI {
             .unwrap_or(APP_NAME.to_owned());
         p.push(name);
         format!("{}.{}", p.to_string_lossy(), self.get_software_ext())
+    }
+
+    fn create_shortcut(&self, _id: String) {
+        #[cfg(windows)]
+        crate::platform::windows::create_shortcut(&_id).ok();
     }
 
     fn open_url(&self, url: String) {
@@ -528,11 +590,16 @@ impl sciter::EventHandler for UI {
         fn get_error();
         fn is_login_wayland();
         fn fix_login_wayland();
+        fn current_is_wayland();
+        fn modify_default_login();
         fn get_options();
         fn get_option(String);
+        fn get_peer_option(String, String);
+        fn set_peer_option(String, String, String);
         fn test_if_valid_server(String);
         fn get_sound_inputs();
         fn set_options(Value);
+        fn set_option(String, String);
         fn get_software_update_url();
         fn get_new_version();
         fn get_version();
@@ -541,6 +608,7 @@ impl sciter::EventHandler for UI {
         fn get_software_store_path();
         fn get_software_ext();
         fn open_url(String);
+        fn create_shortcut(String);
     }
 }
 
@@ -568,7 +636,7 @@ pub fn check_zombie(childs: Childs) {
 
 // notice: avoiding create ipc connecton repeatly,
 // because windows named pipe has serious memory leak issue.
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn check_connect_status_(
     reconnect: bool,
     status: Arc<Mutex<(i32, bool)>>,

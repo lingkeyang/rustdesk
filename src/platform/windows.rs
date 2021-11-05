@@ -3,7 +3,6 @@ use crate::ipc;
 use hbb_common::{
     allow_err, bail,
     config::{Config, APP_NAME},
-    futures_util::stream::StreamExt,
     log, sleep, timeout, tokio,
 };
 use std::io::prelude::*;
@@ -105,6 +104,9 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
             bm_mask.bmHeight / 2
         };
         let cbits_size = width * height * 4;
+        if cbits_size < 16 {
+            bail!("Invalid icon: too small"); // solve some crash
+        }
         let mut cbits: Vec<u8> = Vec::new();
         cbits.resize(cbits_size as _, 0);
         let mut mbits: Vec<u8> = Vec::new();
@@ -137,12 +139,13 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
                 width,
                 height,
                 bm_mask.bmWidthBytes,
+                bm_mask.bmHeight,
             ) > 0;
         }
         if do_outline {
             let mut outline = Vec::new();
             outline.resize(((width + 2) * (height + 2) * 4) as _, 0);
-            drawOutline(outline.as_mut_ptr(), cbits.as_ptr(), width, height);
+            drawOutline(outline.as_mut_ptr(), cbits.as_ptr(), width, height, outline.len() as _);
             cbits = outline;
             width += 2;
             height += 2;
@@ -283,7 +286,7 @@ fn fix_cursor_mask(
     cbits: &mut Vec<u8>,
     width: usize,
     height: usize,
-    width_bytes: usize,
+    bm_width_bytes: usize,
 ) -> bool {
     let mut pix_idx = 0;
     for _ in 0..height {
@@ -296,12 +299,18 @@ fn fix_cursor_mask(
     }
 
     let packed_width_bytes = (width + 7) >> 3;
+    let bm_size = mbits.len();
+    let c_size = cbits.len();
 
     // Pack and invert bitmap data (mbits)
     // borrow from tigervnc
     for y in 0..height {
         for x in 0..packed_width_bytes {
-            mbits[y * packed_width_bytes + x] = !mbits[y * width_bytes + x];
+            let a = y * packed_width_bytes + x;
+            let b = y * bm_width_bytes + x;
+            if a < bm_size && b < bm_size {
+                mbits[a] = !mbits[b];
+            }
         }
     }
 
@@ -313,15 +322,23 @@ fn fix_cursor_mask(
         let mut bitmask: u8 = 0x80;
         for x in 0..width {
             let mask_idx = y * packed_width_bytes + (x >> 3);
-            let pix_idx = y * bytes_row + (x << 2);
-            if (mbits[mask_idx] & bitmask) == 0 {
-                for b1 in 0..4 {
-                    if cbits[pix_idx + b1] != 0 {
-                        mbits[mask_idx] ^= bitmask;
-                        for b2 in b1..4 {
-                            cbits[pix_idx + b2] = 0x00;
+            if mask_idx < bm_size {
+                let pix_idx = y * bytes_row + (x << 2);
+                if (mbits[mask_idx] & bitmask) == 0 {
+                    for b1 in 0..4 {
+                        let a = pix_idx + b1;
+                        if a < c_size {
+                            if cbits[a] != 0 {
+                                mbits[mask_idx] ^= bitmask;
+                                for b2 in b1..4 {
+                                    let b = pix_idx + b2;
+                                    if b < c_size {
+                                        cbits[b] = 0x00;
+                                    }
+                                }
+                                break;
+                            }
                         }
-                        break;
                     }
                 }
             }
@@ -337,11 +354,12 @@ fn fix_cursor_mask(
     for y in 0..height {
         for x in 0..width {
             let mask_idx = y * packed_width_bytes + (x >> 3);
-            let alpha = if (mbits[mask_idx] << (x & 0x7)) & 0x80 == 0 {
-                0
-            } else {
-                255
-            };
+            let mut alpha = 255;
+            if mask_idx < bm_size {
+                if (mbits[mask_idx] << (x & 0x7)) & 0x80 == 0 {
+                   alpha =  0;
+                }
+            }
             let a = cbits[pix_idx + 2];
             let b = cbits[pix_idx + 1];
             let c = cbits[pix_idx];
@@ -375,15 +393,18 @@ extern "C" {
     fn LaunchProcessWin(cmd: *const u16, session_id: DWORD, as_user: BOOL) -> HANDLE;
     fn selectInputDesktop() -> BOOL;
     fn inputDesktopSelected() -> BOOL;
-    fn handleMask(out: *mut u8, mask: *const u8, width: i32, height: i32, bmWidthBytes: i32)
+    fn handleMask(out: *mut u8, mask: *const u8, width: i32, height: i32, bmWidthBytes: i32, bmHeight: i32)
         -> i32;
-    fn drawOutline(out: *mut u8, in_: *const u8, width: i32, height: i32);
+    fn drawOutline(out: *mut u8, in_: *const u8, width: i32, height: i32, out_size: i32);
     fn get_di_bits(out: *mut u8, dc: HDC, hbmColor: HBITMAP, width: i32, height: i32) -> i32;
     fn blank_screen(v: BOOL);
+}
+
+extern "system" {
     fn BlockInput(v: BOOL) -> BOOL;
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         log::info!("Got service control event: {:?}", control_event);
@@ -543,7 +564,7 @@ pub fn run_as_user(arg: &str) -> ResultType<Option<std::process::Child>> {
     Ok(None)
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn send_close(postfix: &str) -> ResultType<()> {
     send_close_async(postfix).await
 }
@@ -562,7 +583,7 @@ async fn send_close_async(postfix: &str) -> ResultType<()> {
 // https://www.cnblogs.com/doutu/p/4892726.html
 fn send_sas() {
     #[link(name = "sas")]
-    extern "C" {
+    extern "system" {
         pub fn SendSAS(AsUser: BOOL);
     }
     unsafe {
@@ -649,7 +670,10 @@ pub fn get_active_username() -> String {
         return "".to_owned();
     }
     let sl = unsafe { std::slice::from_raw_parts(buff.as_ptr(), n as _) };
-    String::from_utf16(sl).unwrap_or("??".to_owned()).trim_end_matches('\0').to_owned()
+    String::from_utf16(sl)
+        .unwrap_or("??".to_owned())
+        .trim_end_matches('\0')
+        .to_owned()
 }
 
 /*
@@ -686,7 +710,7 @@ pub fn is_root() -> bool {
 }
 
 pub fn lock_screen() {
-    extern "C" {
+    extern "system" {
         pub fn LockWorkStation() -> BOOL;
     }
     unsafe {
@@ -723,6 +747,7 @@ pub fn update_me() -> ResultType<()> {
     let src_exe = std::env::current_exe()?.to_str().unwrap_or("").to_owned();
     let cmds = format!(
         "
+        chcp 65001
         sc stop {app_name}
         taskkill /F /IM {app_name}.exe
         copy /Y \"{src_exe}\" \"{exe}\"
@@ -799,6 +824,26 @@ oLink.Save
     .to_str()
     .unwrap_or("")
     .to_owned();
+    let tray_shortcut = write_cmds(
+        format!(
+            "
+Set oWS = WScript.CreateObject(\"WScript.Shell\")
+sLinkFile = \"{tmp_path}\\{app_name} Tray.lnk\"
+
+Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = \"{exe}\"
+    oLink.Arguments = \"--tray\"
+oLink.Save
+        ",
+            tmp_path = tmp_path,
+            app_name = APP_NAME,
+            exe = exe,
+        ),
+        "vbs",
+    )?
+    .to_str()
+    .unwrap_or("")
+    .to_owned();
     let mut shortcuts = Default::default();
     if options.contains("desktopicon") {
         shortcuts = format!(
@@ -830,6 +875,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
     // https://www.tenforums.com/tutorials/70903-add-remove-allowed-apps-through-windows-firewall-windows-10-a.html
     let cmds = format!(
         "
+chcp 65001
 md \"{path}\"
 copy /Y \"{src_exe}\" \"{exe}\"
 reg add {subkey} /f
@@ -847,11 +893,15 @@ reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
 reg add HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /f /v SoftwareSASGeneration /t REG_DWORD /d 1
 \"{mk_shortcut}\"
 \"{uninstall_shortcut}\"
+\"{tray_shortcut}\"
+copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {shortcuts}
 del /f \"{mk_shortcut}\"
 del /f \"{uninstall_shortcut}\"
+del /f \"{tray_shortcut}\"
 del /f \"{tmp_path}\\{app_name}.lnk\"
 del /f \"{tmp_path}\\Uninstall {app_name}.lnk\"
+del /f \"{tmp_path}\\{app_name} Tray.lnk\"
 reg add HKEY_CLASSES_ROOT\\.{ext} /f
 reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f
 reg add HKEY_CLASSES_ROOT\\.{ext}\\DefaultIcon /f /ve /t REG_SZ  /d \"\\\"{exe}\\\",0\"
@@ -881,6 +931,7 @@ sc start {app_name}
         size=size,
         mk_shortcut=mk_shortcut,
         uninstall_shortcut=uninstall_shortcut,
+        tray_shortcut=tray_shortcut,
         tmp_path=tmp_path,
         shortcuts=shortcuts,
         config_path=config_path,
@@ -889,7 +940,8 @@ sc start {app_name}
     );
     run_cmds(cmds, false)?;
     std::thread::sleep(std::time::Duration::from_millis(2000));
-    std::process::Command::new(exe).spawn()?;
+    std::process::Command::new(&exe).spawn()?;
+    std::process::Command::new(&exe).arg("--tray").spawn()?;
     std::thread::sleep(std::time::Duration::from_millis(1000));
     Ok(())
 }
@@ -899,6 +951,7 @@ pub fn uninstall_me() -> ResultType<()> {
     let ext = APP_NAME.to_lowercase();
     let cmds = format!(
         "
+chcp 65001
 sc stop {app_name}
 sc delete {app_name}
 taskkill /F /IM {app_name}.exe
@@ -907,6 +960,7 @@ reg delete HKEY_CLASSES_ROOT\\.{ext} /f
 rd /s /q \"{path}\"
 rd /s /q \"{start_menu}\"
 del /f /q \"%PUBLIC%\\Desktop\\{app_name}*\"
+del /f /q \"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
 netsh advfirewall firewall delete rule name=\"{app_name} Service\"
     ",
         app_name = APP_NAME,
@@ -920,12 +974,15 @@ netsh advfirewall firewall delete rule name=\"{app_name} Service\"
 
 fn write_cmds(cmds: String, ext: &str) -> ResultType<std::path::PathBuf> {
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("{}_{}.{}", APP_NAME, crate::get_time(), ext));
+    tmp.push(format!("{}_{:?}.{}", APP_NAME, cmds.as_ptr(), ext));
     let mut cmds = cmds;
     if ext == "cmd" {
         cmds = format!("{}\ndel /f \"{}\"", cmds, tmp.to_str().unwrap_or(""));
     }
     let mut file = std::fs::File::create(&tmp)?;
+    // in case cmds mixed with \r\n and \n, make sure all ending with \r\n
+    // in some windows, \r\n required for cmd file to run
+    let cmds = cmds.replace("\r\n", "\n").replace("\n", "\r\n");
     file.write_all(cmds.as_bytes())?;
     file.sync_all()?;
     return Ok(tmp);
@@ -1000,4 +1057,33 @@ pub fn get_installed_version() -> String {
         }
     }
     "".to_owned()
+}
+
+pub fn create_shortcut(id: &str) -> ResultType<()> {
+    let exe = std::env::current_exe()?.to_str().unwrap_or("").to_owned();
+    let shortcut = write_cmds(
+        format!(
+            "
+Set oWS = WScript.CreateObject(\"WScript.Shell\")
+strDesktop = oWS.SpecialFolders(\"Desktop\")
+Set objFSO = CreateObject(\"Scripting.FileSystemObject\")
+sLinkFile = objFSO.BuildPath(strDesktop, \"{id}.lnk\")
+Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = \"{exe}\"
+    oLink.Arguments = \"--connect {id}\"
+oLink.Save
+        ",
+            exe = exe,
+            id = id,
+        ),
+        "vbs",
+    )?
+    .to_str()
+    .unwrap_or("")
+    .to_owned();
+    std::process::Command::new("cscript")
+        .arg(&shortcut)
+        .output()?;
+    allow_err!(std::fs::remove_file(shortcut));
+    Ok(())
 }

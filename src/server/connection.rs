@@ -5,11 +5,10 @@ use crate::ipc;
 use hbb_common::{
     config::Config,
     fs,
-    futures::SinkExt,
+    futures::{SinkExt, StreamExt},
     sleep, timeout,
     tokio::{
         net::TcpStream,
-        stream::StreamExt,
         sync::mpsc,
         time::{self, Duration, Instant, Interval},
     },
@@ -20,7 +19,6 @@ use sha2::{Digest, Sha256};
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
 lazy_static::lazy_static! {
-    static ref CLICK_TIME: Arc::<Mutex<i64>> = Default::default();
     static ref LOGIN_FAILURES: Arc::<Mutex<HashMap<String, (i32, i32, i32)>>> = Default::default();
 }
 
@@ -638,14 +636,19 @@ impl Connection {
                 Some(message::Union::mouse_event(me)) => {
                     if self.keyboard {
                         handle_mouse(&me, self.inner.id());
-                        if is_left_up(&me) {
-                            *CLICK_TIME.lock().unwrap() = crate::get_time();
-                        }
                     }
                 }
                 Some(message::Union::key_event(mut me)) => {
                     if self.keyboard {
-                        if me.press {
+                        // handle all down as press
+                        // fix unexpected repeating key on remote linux, seems also fix abnormal alt/shift, which
+                        // make sure all key are released
+                        let is_press = if cfg!(target_os = "linux") {
+                            (me.press || me.down) && !crate::is_modifier(&me)
+                        } else {
+                            me.press
+                        };
+                        if is_press {
                             if let Some(key_event::Union::unicode(_)) = me.union {
                                 handle_key(&me);
                             } else if let Some(key_event::Union::seq(_)) = me.union {
@@ -658,9 +661,6 @@ impl Connection {
                             }
                         } else {
                             handle_key(&me);
-                        }
-                        if is_enter(&me) {
-                            *CLICK_TIME.lock().unwrap() = crate::get_time();
                         }
                     }
                 }
@@ -816,7 +816,7 @@ impl Connection {
                 self.disable_audio = q == BoolOption::Yes;
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
-                        NAME_CURSOR,
+                        super::audio_service::NAME,
                         self.inner.clone(),
                         self.audio_enabled(),
                     );
@@ -828,7 +828,7 @@ impl Connection {
                 self.disable_clipboard = q == BoolOption::Yes;
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
-                        NAME_CURSOR,
+                        super::clipboard_service::NAME,
                         self.inner.clone(),
                         self.clipboard_enabled() && self.keyboard,
                     );
@@ -938,18 +938,7 @@ async fn start_ipc(
                         return Err(err.into());
                     }
                     Ok(Some(data)) => {
-                        match data {
-                            ipc::Data::ClickTime(_)=> {
-                                unsafe {
-                                    let ct = *CLICK_TIME.lock().unwrap();
-                                    let data = ipc::Data::ClickTime(ct);
-                                    stream.send(&data).await?;
-                                }
-                            }
-                            _ => {
-                                tx_from_cm.send(data)?;
-                            }
-                        }
+                        tx_from_cm.send(data)?;
                     }
                     _ => {}
                 }

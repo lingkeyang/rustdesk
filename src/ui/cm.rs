@@ -1,6 +1,4 @@
 use crate::ipc::{self, new_listener, Connection, Data};
-#[cfg(windows)]
-use hbb_common::futures_util::stream::StreamExt;
 use hbb_common::{
     allow_err,
     config::{Config, ICON},
@@ -59,13 +57,6 @@ impl ConnectionManager {
         ICON.to_owned()
     }
 
-    fn check_click_time(&mut self, id: i32) {
-        let lock = self.read().unwrap();
-        if let Some(s) = lock.senders.get(&id) {
-            allow_err!(s.send(Data::ClickTime(crate::get_time())));
-        }
-    }
-
     #[inline]
     fn call(&self, func: &str, args: &[Value]) {
         let r = self.read().unwrap();
@@ -119,9 +110,6 @@ impl ConnectionManager {
         match data {
             Data::ChatMessage { text } => {
                 self.call("newMessage", &make_args!(id, text));
-            }
-            Data::ClickTime(ms) => {
-                self.call("resetClickCallback", &make_args!(ms as f64));
             }
             Data::FS(v) => match v {
                 ipc::FS::ReadDir {
@@ -320,7 +308,6 @@ impl sciter::EventHandler for ConnectionManager {
     }
 
     sciter::dispatch_script_call! {
-        fn check_click_time(i32);
         fn get_icon();
         fn close(i32);
         fn authorize(i32);
@@ -330,7 +317,7 @@ impl sciter::EventHandler for ConnectionManager {
     }
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn start_ipc(cm: ConnectionManager) {
     match new_listener("_cm").await {
         Ok(mut incoming) => {
@@ -387,7 +374,7 @@ async fn start_ipc(cm: ConnectionManager) {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn start_pa() {
     use hbb_common::config::APP_NAME;
     use libpulse_binding as pulse;

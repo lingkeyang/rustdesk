@@ -66,7 +66,7 @@ async fn accept_connection_(server: ServerPtr, socket: Stream, secure: bool) -> 
     // even we drop socket, below still may fail if not use reuse_addr,
     // there is TIME_WAIT before socket really released, so sometimes we
     // see “Only one usage of each socket address is normally permitted” on windows sometimes,
-    let mut listener = new_listener(local_addr, true).await?;
+    let listener = new_listener(local_addr, true).await?;
     log::info!("Server listening on: {}", &listener.local_addr()?);
     if let Ok((stream, addr)) = timeout(CONNECT_TIMEOUT, listener.accept()).await? {
         create_tcp_connection_(server, Stream::from(stream), addr, secure).await?;
@@ -121,7 +121,10 @@ async fn create_tcp_connection_(
                             let mut key = [0u8; secretbox::KEYBYTES];
                             key[..].copy_from_slice(&symmetric_key);
                             stream.set_key(secretbox::Key(key));
-                        } else if !pk.asymmetric_value.is_empty() {
+                        } else if pk.asymmetric_value.is_empty() {
+                            // force a trial to update_pk to rendezvous server
+                            Config::set_key_confirmed(false);
+                        } else {
                             bail!("Handshake failed: invalid public sign key length from peer");
                         }
                     } else {
@@ -269,29 +272,7 @@ pub async fn start_server(is_server: bool, _tray: bool) {
                 std::process::exit(-1);
             }
         });
-        /*
-        tray is buggy, and not work on win10 2004, also cause crash, disable it
-        #[cfg(windows)]
-        if _tray {
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if !crate::platform::is_prelogin() {
-                    let mut res = Ok(None);
-                    // while switching from prelogin to user screen, run_as_user may fails,
-                    // so we try more times
-                    for _ in 0..10 {
-                        res = crate::platform::run_as_user("--tray");
-                        if res.is_ok() {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
-                    allow_err!(res);
-                    break;
-                }
-            });
-        }
-        */
+        input_service::fix_key_down_timeout_loop();
         crate::RendezvousMediator::start_all().await;
     } else {
         match crate::ipc::connect(1000, "").await {

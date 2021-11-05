@@ -1,6 +1,6 @@
-pub use copypasta::{ClipboardContext, ClipboardProvider};
+pub use arboard::Clipboard as ClipboardContext;
 use hbb_common::{
-    allow_err,
+    allow_err, bail,
     compress::{compress as compress_func, decompress},
     config::{Config, COMPRESS_LEVEL, RENDEZVOUS_TIMEOUT},
     log,
@@ -50,29 +50,33 @@ pub fn valid_for_capslock(evt: &KeyEvent) -> bool {
     }
 }
 
+pub fn create_clipboard_msg(content: String) -> Message {
+    let bytes = content.into_bytes();
+    let compressed = compress_func(&bytes, COMPRESS_LEVEL);
+    let compress = compressed.len() < bytes.len();
+    let content = if compress { compressed } else { bytes };
+    let mut msg = Message::new();
+    msg.set_clipboard(Clipboard {
+        compress,
+        content,
+        ..Default::default()
+    });
+    msg
+}
+
 pub fn check_clipboard(
     ctx: &mut ClipboardContext,
     old: Option<&Arc<Mutex<String>>>,
 ) -> Option<Message> {
     let side = if old.is_none() { "host" } else { "client" };
     let old = if let Some(old) = old { old } else { &CONTENT };
-    if let Ok(content) = ctx.get_contents() {
+    if let Ok(content) = ctx.get_text() {
         if content.len() < 2_000_000 && !content.is_empty() {
             let changed = content != *old.lock().unwrap();
             if changed {
                 log::info!("{} update found on {}", CLIPBOARD_NAME, side);
-                let bytes = content.clone().into_bytes();
-                *old.lock().unwrap() = content;
-                let compressed = compress_func(&bytes, COMPRESS_LEVEL);
-                let compress = compressed.len() < bytes.len();
-                let content = if compress { compressed } else { bytes };
-                let mut msg = Message::new();
-                msg.set_clipboard(Clipboard {
-                    compress,
-                    content,
-                    ..Default::default()
-                });
-                return Some(msg);
+                *old.lock().unwrap() = content.clone();
+                return Some(create_clipboard_msg(content));
             }
         }
     }
@@ -91,7 +95,7 @@ pub fn update_clipboard(clipboard: Clipboard, old: Option<&Arc<Mutex<String>>>) 
                 let side = if old.is_none() { "host" } else { "client" };
                 let old = if let Some(old) = old { old } else { &CONTENT };
                 *old.lock().unwrap() = content.clone();
-                allow_err!(ctx.set_contents(content));
+                allow_err!(ctx.set_text(content));
                 log::debug!("{} updated on {}", CLIPBOARD_NAME, side);
             }
             Err(err) => {
@@ -101,6 +105,65 @@ pub fn update_clipboard(clipboard: Clipboard, old: Option<&Arc<Mutex<String>>>) 
     }
 }
 
+#[cfg(feature = "use_rubato")]
+pub fn resample_channels(
+    data: &[f32],
+    sample_rate0: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<f32> {
+    use rubato::{
+        InterpolationParameters, InterpolationType, Resampler, SincFixedIn, WindowFunction,
+    };
+    let params = InterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: InterpolationType::Nearest,
+        oversampling_factor: 160,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let mut resampler = SincFixedIn::<f64>::new(
+        sample_rate as f64 / sample_rate0 as f64,
+        params,
+        data.len() / (channels as usize),
+        channels as _,
+    );
+    let mut waves_in = Vec::new();
+    if channels == 2 {
+        waves_in.push(
+            data.iter()
+                .step_by(2)
+                .map(|x| *x as f64)
+                .collect::<Vec<_>>(),
+        );
+        waves_in.push(
+            data.iter()
+                .skip(1)
+                .step_by(2)
+                .map(|x| *x as f64)
+                .collect::<Vec<_>>(),
+        );
+    } else {
+        waves_in.push(data.iter().map(|x| *x as f64).collect::<Vec<_>>());
+    }
+    if let Ok(x) = resampler.process(&waves_in) {
+        if x.is_empty() {
+            Vec::new()
+        } else if x.len() == 2 {
+            x[0].chunks(1)
+                .zip(x[1].chunks(1))
+                .flat_map(|(a, b)| a.into_iter().chain(b))
+                .map(|x| *x as f32)
+                .collect()
+        } else {
+            x[0].iter().map(|x| *x as f32).collect()
+        }
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(feature = "use_dasp")]
 pub fn resample_channels(
     data: &[f32],
     sample_rate0: u32,
@@ -136,6 +199,24 @@ pub fn resample_channels(
     }
 }
 
+#[cfg(feature = "use_samplerate")]
+pub fn resample_channels(
+    data: &[f32],
+    sample_rate0: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<f32> {
+    use samplerate::{convert, ConverterType};
+    convert(
+        sample_rate0 as _,
+        sample_rate as _,
+        channels as _,
+        ConverterType::SincBestQuality,
+        data,
+    )
+    .unwrap_or_default()
+}
+
 pub fn test_nat_type() {
     std::thread::spawn(move || loop {
         match test_nat_type_() {
@@ -152,12 +233,17 @@ pub fn test_nat_type() {
     });
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn test_nat_type_() -> ResultType<bool> {
+    log::info!("Testing nat ...");
     let start = std::time::Instant::now();
     let rendezvous_server = get_rendezvous_server(100).await;
     let server1 = rendezvous_server;
     let mut server2 = server1;
+    if server1.port() == 0 { // offline
+        // avoid overflow crash
+        bail!("Offline");
+    }
     server2.set_port(server1.port() - 1);
     let mut msg_out = RendezvousMessage::new();
     let serial = Config::get_serial();
@@ -206,7 +292,7 @@ async fn test_nat_type_() -> ResultType<bool> {
             NatType::SYMMETRIC
         };
         Config::set_nat_type(t as _);
-        log::info!("tested nat type: {:?} in {:?}", t, start.elapsed());
+        log::info!("Tested nat type: {:?} in {:?}", t, start.elapsed());
     }
     Ok(ok)
 }
@@ -232,9 +318,10 @@ pub async fn get_nat_type(ms_timeout: u64) -> i32 {
 }
 
 #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn test_rendezvous_server_() {
     let servers = Config::get_rendezvous_servers();
+    hbb_common::config::ONLINE.lock().unwrap().clear();
     let mut futs = Vec::new();
     for host in servers {
         futs.push(tokio::spawn(async move {
@@ -311,6 +398,10 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
             || v == ControlKey::Shift.value()
             || v == ControlKey::Control.value()
             || v == ControlKey::Meta.value()
+            || v == ControlKey::RAlt.value()
+            || v == ControlKey::RShift.value()
+            || v == ControlKey::RControl.value()
+            || v == ControlKey::RWin.value()
     } else {
         false
     }
@@ -339,7 +430,7 @@ pub fn check_software_update() {
     std::thread::spawn(move || allow_err!(_check_software_update()));
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn _check_software_update() -> hbb_common::ResultType<()> {
     sleep(3.).await;
     let rendezvous_server = get_rendezvous_server(1_000).await;

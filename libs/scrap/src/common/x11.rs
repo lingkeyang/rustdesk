@@ -21,7 +21,7 @@ impl Capturer {
     }
 }
 
-pub struct Frame<'a>(&'a [u8]);
+pub struct Frame<'a>(pub(crate) &'a [u8]);
 
 impl<'a> ops::Deref for Frame<'a> {
     type Target = [u8];
@@ -68,7 +68,7 @@ impl Display {
         self.0.rect().h as usize
     }
 
-    pub fn origin(&self) -> (usize, usize) {
+    pub fn origin(&self) -> (i32, i32) {
         let r = self.0.rect();
         (r.x as _, r.y as _)
     }

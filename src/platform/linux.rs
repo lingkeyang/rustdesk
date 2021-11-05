@@ -12,6 +12,7 @@ use std::{
 type Xdo = *const c_void;
 
 pub const PA_SAMPLE_RATE: u32 = 24000;
+static mut UNMODIFIED: bool = true;
 
 thread_local! {
     static XDO: RefCell<Xdo> = RefCell::new(unsafe { xdo_new(std::ptr::null()) });
@@ -164,7 +165,7 @@ pub fn start_os_service() {
             uid = tmp;
             log::info!("uid of seat0: {}", uid);
             let gdm = format!("/run/user/{}/gdm/Xauthority", uid);
-            let mut auth = get_env("XAUTHORITY", &uid);
+            let mut auth = get_env_tries("XAUTHORITY", &uid, 10);
             if auth.is_empty() {
                 auth = if std::path::Path::new(&gdm).exists() {
                     gdm
@@ -187,8 +188,9 @@ pub fn start_os_service() {
                 d = get_display();
             }
             if d.is_empty() {
-                d = ":0".to_owned()
+                d = ":0".to_owned();
             }
+            d = d.replace(&whoami::hostname(), "").replace("localhost", "");
             log::info!("DISPLAY: {}", d);
             log::info!("XAUTHORITY: {}", auth);
             std::env::set_var("XAUTHORITY", auth);
@@ -289,6 +291,7 @@ fn get_display() -> String {
     }
     // above not work for gdm user
     log::debug!("ls -l /tmp/.X11-unix/");
+    let mut last = "".to_owned();
     if let Ok(output) = std::process::Command::new("ls")
         .args(vec!["-l", "/tmp/.X11-unix/"])
         .output()
@@ -296,16 +299,18 @@ fn get_display() -> String {
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             log::debug!("  {}", line);
             let mut iter = line.split_whitespace();
-            if iter.nth(2) == Some(&user) {
-                if let Some(x) = iter.last() {
-                    if x.starts_with("X") {
-                        return x.replace("X", ":").to_owned();
+            let user_field = iter.nth(2);
+            if let Some(x) = iter.last() {
+                if x.starts_with("X") {
+                    last = x.replace("X", ":").to_owned();
+                    if user_field == Some(&user) {
+                        return last;
                     }
                 }
             }
         }
     }
-    "".to_owned()
+    last
 }
 
 fn get_value_of_seat0(i: usize) -> String {
@@ -322,19 +327,71 @@ fn get_value_of_seat0(i: usize) -> String {
             }
         }
     }
+
+    // some case, there is no seat0 https://github.com/rustdesk/rustdesk/issues/73
+    if let Ok(output) = std::process::Command::new("loginctl").output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(sid) = line.split_whitespace().nth(0) {
+                let d = get_display_server_of_session(sid);
+                if is_active(sid) && d != "tty" {
+                    if let Some(uid) = line.split_whitespace().nth(i) {
+                        return uid.to_owned();
+                    }
+                }
+            }
+        }
+    }
+
     return "".to_owned();
 }
 
 pub fn get_display_server() -> String {
     let session = get_value_of_seat0(0);
+    get_display_server_of_session(&session)
+}
+
+fn get_display_server_of_session(session: &str) -> String {
     if let Ok(output) = std::process::Command::new("loginctl")
-        .args(vec!["show-session", "-p", "Type", &session])
+        .args(vec!["show-session", "-p", "Type", session])
         .output()
+    // Check session type of the session
     {
-        String::from_utf8_lossy(&output.stdout)
+        let display_server = String::from_utf8_lossy(&output.stdout)
             .replace("Type=", "")
             .trim_end()
-            .into()
+            .into();
+        if display_server == "tty" {
+            // If the type is tty...
+            if let Ok(output) = std::process::Command::new("loginctl")
+                .args(vec!["show-session", "-p", "TTY", session])
+                .output()
+            // Get the tty number
+            {
+                let tty: String = String::from_utf8_lossy(&output.stdout)
+                    .replace("TTY=", "")
+                    .trim_end()
+                    .into();
+                if let Ok(Some(xorg_results)) =
+                    run_cmds(format!("ps -e | grep \"{}.\\\\+Xorg\"", tty))
+                // And check if Xorg is running on that tty
+                {
+                    if xorg_results.trim_end().to_string() != "" {
+                        // If it is, manually return "x11", otherwise return tty
+                        "x11".to_owned()
+                    } else {
+                        display_server
+                    }
+                } else {
+                    // If any of these commands fail just fall back to the display server
+                    display_server
+                }
+            } else {
+                display_server
+            }
+        } else {
+            // If the session is not a tty, then just return the type as usual
+            display_server
+        }
     } else {
         "".to_owned()
     }
@@ -343,18 +400,24 @@ pub fn get_display_server() -> String {
 pub fn is_login_wayland() -> bool {
     if let Ok(contents) = std::fs::read_to_string("/etc/gdm3/custom.conf") {
         contents.contains("#WaylandEnable=false")
+    } else if let Ok(contents) = std::fs::read_to_string("/etc/gdm/custom.conf") {
+        contents.contains("#WaylandEnable=false")
     } else {
         false
     }
 }
 
 pub fn fix_login_wayland() {
+    let mut file = "/etc/gdm3/custom.conf".to_owned();
+    if !std::path::Path::new(&file).exists() {
+        file = "/etc/gdm/custom.conf".to_owned();
+    }
     match std::process::Command::new("pkexec")
         .args(vec![
             "sed",
             "-i",
             "s/#WaylandEnable=false/WaylandEnable=false/g",
-            "/etc/gdm3/custom.conf",
+            &file
         ])
         .output()
     {
@@ -368,6 +431,72 @@ pub fn fix_login_wayland() {
             log::error!("fix_login_wayland failed: {}", err);
         }
     }
+}
+
+pub fn current_is_wayland() -> bool {
+    let dtype = get_display_server();
+    return "wayland" == dtype && unsafe{UNMODIFIED};
+}
+
+pub fn modify_default_login() -> String {
+    let dsession = std::env::var("DESKTOP_SESSION").unwrap();
+    let user_name = std::env::var("USERNAME").unwrap();
+    if let Ok(Some(x)) = run_cmds("ls /usr/share/* | grep ${DESKTOP_SESSION}-xorg.desktop".to_owned()) {
+        if x.trim_end().to_string() != "" {
+            match std::process::Command::new("pkexec")
+                .args(vec![
+                    "sed",
+                    "-i",
+                    &format!("s/={0}$/={0}-xorg/g", &dsession),
+                    &format!("/var/lib/AccountsService/users/{}", &user_name)
+                ])
+                .output()
+            {
+                Ok(x) => {
+                    let x = String::from_utf8_lossy(&x.stderr);
+                    if !x.is_empty() {
+                        log::error!("modify_default_login failed: {}", x);
+                        return "Fix failed! Please re-login with X server manually".to_owned();
+                    } else {
+                        unsafe {UNMODIFIED = false;}
+                        return "".to_owned();
+                    }
+                }
+                Err(err) => {
+                    log::error!("modify_default_login failed: {}", err);
+                    return "Fix failed! Please re-login with X server manually".to_owned();
+                }
+            }
+        } else if let Ok(Some(z)) = run_cmds("ls /usr/share/* | grep ${DESKTOP_SESSION:0:-8}.desktop".to_owned()) {
+            if z.trim_end().to_string() != "" {
+                match std::process::Command::new("pkexec")
+                    .args(vec![
+                        "sed",
+                        "-i",
+                        &format!("s/={}$/={}/g", &dsession, &dsession[..dsession.len()-8]),
+                        &format!("/var/lib/AccountsService/users/{}", &user_name)
+                    ])
+                    .output()
+                {
+                    Ok(x) => {
+                        let x = String::from_utf8_lossy(&x.stderr);
+                        if !x.is_empty() {
+                            log::error!("modify_default_login failed: {}", x);
+                            return "Fix failed! Please re-login with X server manually".to_owned();
+                        } else {
+                            unsafe {UNMODIFIED = false;}
+                            return "".to_owned();
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("modify_default_login failed: {}", err);
+                        return "Fix failed! Please re-login with X server manually".to_owned();
+                    }
+                }
+            }
+        }
+    }
+    return "Fix failed! Please re-login with X server manually".to_owned();
 }
 
 // to-do: test the other display manager
@@ -493,6 +622,17 @@ fn run_cmds(cmds: String) -> ResultType<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+fn get_env_tries(name: &str, uid: &str, n: usize) -> String {
+    for _ in 0..n {
+        let x = get_env(name, uid);
+        if !x.is_empty() {
+            return x;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    "".to_owned()
 }
 
 fn get_env(name: &str, uid: &str) -> String {

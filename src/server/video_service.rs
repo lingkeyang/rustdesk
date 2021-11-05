@@ -46,11 +46,11 @@ pub fn new() -> GenericService {
 fn run(sp: GenericService) -> ResultType<()> {
     let fps = 30;
     let spf = time::Duration::from_secs_f32(1. / (fps as f32));
-    let (n, current, display) = get_current_display()?;
+    let (ndisplay, current, display) = get_current_display()?;
     let (origin, width, height) = (display.origin(), display.width(), display.height());
     log::debug!(
         "#displays={}, current={}, origin: {:?}, width={}, height={}",
-        n,
+        ndisplay,
         current,
         &origin,
         width,
@@ -74,7 +74,11 @@ fn run(sp: GenericService) -> ResultType<()> {
         speed,
     };
     let mut vpx;
-    match Encoder::new(&cfg, 1) {
+    let mut n = ((width * height) as f64 / (1920 * 1080) as f64).round() as u32;
+    if n < 1 {
+        n = 1;
+    }
+    match Encoder::new(&cfg, n) {
         Ok(x) => vpx = x,
         Err(err) => bail!("Failed to create encoder: {}", err),
     }
@@ -95,24 +99,15 @@ fn run(sp: GenericService) -> ResultType<()> {
         *SWITCH.lock().unwrap() = false;
         sp.send(msg_out);
     }
-
-    #[cfg(windows)]
-    if !c.is_gdi() {
-        // dxgi duplicateoutput has no output if display no change, so we use gdi this as workaround
-        if c.set_gdi() {
-            // dgx capture release has memory leak somehow, so use gdi always before fixing it, just sacrificing some cpu
-            /*
-            if let Ok(frame) = c.frame(wait as _) {
-                handle_one_frame(&sp, &frame, 0, &mut vpx)?;
-            }
-            c.cancel_gdi();
-            */
-        }
-    }
-
-    let start = time::Instant::now();
+    
     let mut crc = (0, 0);
+    let start = time::Instant::now();
     let mut last_sent = time::Instant::now();
+    let mut last_check_displays = time::Instant::now();
+    #[cfg(windows)]
+    let mut try_gdi = true;
+    #[cfg(windows)]
+    log::info!("gdi: {}", c.is_gdi());
     while sp.ok() {
         if *SWITCH.lock().unwrap() {
             bail!("SWITCH");
@@ -131,6 +126,14 @@ fn run(sp: GenericService) -> ResultType<()> {
             }
         }
         let now = time::Instant::now();
+        if last_check_displays.elapsed().as_millis() > 1000 {
+            last_check_displays = now;
+            if ndisplay != get_display_num() {
+                log::info!("Displays changed");
+                *SWITCH.lock().unwrap() = true;
+                bail!("SWITCH");
+            }
+        }
         *LAST_ACTIVE.lock().unwrap() = now;
         if get_latency() < 1000 || last_sent.elapsed().as_millis() > 1000 {
             match c.frame(wait as _) {
@@ -139,12 +142,22 @@ fn run(sp: GenericService) -> ResultType<()> {
                     let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
                     handle_one_frame(&sp, &frame, ms, &mut crc, &mut vpx)?;
                     last_sent = now;
+                    #[cfg(windows)]
+                    {
+                        try_gdi = false;
+                    }
                 }
                 Err(ref e) if e.kind() == WouldBlock => {
                     // https://github.com/NVIDIA/video-sdk-samples/tree/master/nvEncDXGIOutputDuplicationSample
                     wait = WAIT_BASE - now.elapsed().as_millis() as i32;
                     if wait < 0 {
                         wait = 0
+                    }
+                    #[cfg(windows)]
+                    if try_gdi && !c.is_gdi() {
+                        c.set_gdi();
+                        try_gdi = false;
+                        log::info!("No image, fall back to gdi");
                     }
                     continue;
                 }
@@ -226,6 +239,14 @@ fn handle_one_frame(
         }
     }
     Ok(())
+}
+
+fn get_display_num() -> usize {
+    if let Ok(d) = Display::all() {
+        d.len()
+    } else {
+        0
+    }
 }
 
 pub fn get_displays() -> ResultType<(usize, Vec<DisplayInfo>)> {

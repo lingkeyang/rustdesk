@@ -5,10 +5,13 @@ use hbb_common::{
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
     log, timeout, tokio,
+    tokio::io::{AsyncRead, AsyncWrite},
     tokio_util::codec::Framed,
     ResultType,
 };
-use parity_tokio_ipc::{Connection as Conn, Endpoint, Incoming, SecurityAttributes};
+use parity_tokio_ipc::{
+    Connection as Conn, ConnectionClient as ConnClient, Endpoint, Incoming, SecurityAttributes,
+};
 use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr};
 #[cfg(not(windows))]
@@ -77,7 +80,6 @@ pub enum Data {
         enabled: bool,
     },
     SystemInfo(Option<String>),
-    ClickTime(i64),
     Authorize,
     Close,
     SAS,
@@ -91,11 +93,8 @@ pub enum Data {
     Test,
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 pub async fn start(postfix: &str) -> ResultType<()> {
-    if postfix.is_empty() {
-        crate::common::test_nat_type();
-    }
     let mut incoming = new_listener(postfix).await?;
     loop {
         if let Some(result) = incoming.next().await {
@@ -171,6 +170,7 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         Data::Close => {
             log::info!("Receive close message");
+            crate::server::input_service::fix_key_down_timeout_at_exit();
             std::process::exit(0);
         }
         Data::OnlineStatus(_) => {
@@ -238,10 +238,10 @@ async fn handle(data: Data, stream: &mut Connection) {
     }
 }
 
-pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<Connection> {
+pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmpl<ConnClient>> {
     let path = Config::ipc_path(postfix);
     let client = timeout(ms_timeout, Endpoint::connect(&path)).await??;
-    Ok(Connection::new(client))
+    Ok(ConnectionTmpl::new(client))
 }
 
 #[inline]
@@ -287,12 +287,17 @@ fn write_pid(postfix: &str) {
     }
 }
 
-pub struct Connection {
-    inner: Framed<Conn, BytesCodec>,
+pub struct ConnectionTmpl<T> {
+    inner: Framed<T, BytesCodec>,
 }
 
-impl Connection {
-    pub fn new(conn: Conn) -> Self {
+pub type Connection = ConnectionTmpl<Conn>;
+
+impl<T> ConnectionTmpl<T>
+where
+    T: AsyncRead + AsyncWrite + std::marker::Unpin,
+{
+    pub fn new(conn: T) -> Self {
         Self {
             inner: Framed::new(conn, BytesCodec::new()),
         }
@@ -339,7 +344,7 @@ impl Connection {
     }
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn get_config(name: &str) -> ResultType<Option<String>> {
     get_config_async(name, 1_000).await
 }
@@ -355,7 +360,7 @@ async fn get_config_async(name: &str, ms_timeout: u64) -> ResultType<Option<Stri
     return Ok(None);
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 async fn set_config(name: &str, value: String) -> ResultType<()> {
     let mut c = connect(1000, "").await?;
     c.send_config(name, value).await?;
@@ -412,7 +417,7 @@ async fn get_options_(ms_timeout: u64) -> ResultType<HashMap<String, String>> {
     }
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 pub async fn get_options() -> HashMap<String, String> {
     get_options_(1000).await.unwrap_or(Config::get_options())
 }
@@ -435,7 +440,7 @@ pub fn set_option(key: &str, value: &str) {
     set_options(options).ok();
 }
 
-#[tokio::main(basic_scheduler)]
+#[tokio::main(flavor = "current_thread")]
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
     Config::set_options(value.clone());
     connect(1000, "")
@@ -462,3 +467,63 @@ pub async fn get_nat_type(ms_timeout: u64) -> i32 {
         .await
         .unwrap_or(Config::get_nat_type())
 }
+
+/*
+static mut SHARED_MEMORY: *mut i64 = std::ptr::null_mut();
+
+pub fn initialize_shared_memory(create: bool) {
+    let mut shmem_flink = "shared-memory".to_owned();
+    if cfg!(windows) {
+        let df = "C:\\ProgramData";
+        let df = if std::path::Path::new(df).exists() {
+            df.to_owned()
+        } else {
+            std::env::var("TEMP").unwrap_or("C:\\Windows\\TEMP".to_owned())
+        };
+        let df = format!("{}\\{}", df, *hbb_common::config::APP_NAME.read().unwrap());
+        std::fs::create_dir(&df).ok();
+        shmem_flink = format!("{}\\{}", df, shmem_flink);
+    } else {
+        shmem_flink = Config::ipc_path("").replace("ipc", "") + &shmem_flink;
+    }
+    use shared_memory::*;
+    let shmem = if create {
+        match ShmemConf::new()
+            .force_create_flink()
+            .size(16)
+            .flink(&shmem_flink)
+            .create()
+        {
+            Err(ShmemError::LinkExists) => ShmemConf::new().flink(&shmem_flink).open(),
+            Ok(m) => Ok(m),
+            Err(e) => Err(e),
+        }
+    } else {
+        ShmemConf::new().flink(&shmem_flink).open()
+    };
+    if create {
+        set_all_perm(&shmem_flink);
+    }
+    match shmem {
+        Ok(shmem) => unsafe {
+            SHARED_MEMORY = shmem.as_ptr() as *mut i64;
+            std::mem::forget(shmem);
+        },
+        Err(err) => {
+            log::error!(
+                "Unable to create or open shmem flink {} : {}",
+                shmem_flink,
+                err
+            );
+        }
+    }
+}
+
+fn set_all_perm(p: &str) {
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o0777)).ok();
+    }
+}
+*/

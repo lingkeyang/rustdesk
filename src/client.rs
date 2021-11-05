@@ -100,7 +100,7 @@ impl Drop for OboePlayer {
 }
 
 impl Client {
-    pub async fn start(peer: &str) -> ResultType<(Stream, bool)> {
+    pub async fn start(peer: &str, conn_type: ConnType) -> ResultType<(Stream, bool)> {
         // to-do: remember the port for each peer, so that we can retry easier
         let any_addr = Config::get_any_listen_addr();
         let rendezvous_server = crate::get_rendezvous_server(1_000).await;
@@ -125,22 +125,30 @@ impl Client {
             msg_out.set_punch_hole_request(PunchHoleRequest {
                 id: peer.to_owned(),
                 nat_type: nat_type.into(),
+                conn_type: conn_type.into(),
                 ..Default::default()
             });
             socket.send(&msg_out).await?;
-            if let Some(Ok(bytes)) = socket.next_timeout(i * 3000).await {
+            if let Some(Ok(bytes)) = socket.next_timeout(i * 6000).await {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
                     match msg_in.union {
                         Some(rendezvous_message::Union::punch_hole_response(ph)) => {
                             if ph.socket_addr.is_empty() {
                                 match ph.failure.enum_value_or_default() {
                                     punch_hole_response::Failure::ID_NOT_EXIST => {
-                                        bail!("ID not exist");
+                                        bail!("ID does not exist");
                                     }
                                     punch_hole_response::Failure::OFFLINE => {
                                         bail!("Remote desktop is offline");
                                     }
-                                    _ => {}
+                                    punch_hole_response::Failure::LICENCE_MISMATCH => {
+                                        bail!("Key mismatch");
+                                    }
+                                    _ => {
+                                        if !ph.other_failure.is_empty() {
+                                            bail!(ph.other_failure);
+                                        }
+                                    }
                                 }
                             } else {
                                 peer_nat_type = ph.get_nat_type();
@@ -160,7 +168,8 @@ impl Client {
                             );
                             pk = rr.get_pk().into();
                             let mut conn =
-                                Self::create_relay(peer, rr.uuid, rr.relay_server).await?;
+                                Self::create_relay(peer, rr.uuid, rr.relay_server, conn_type)
+                                    .await?;
                             Self::secure_connection(peer, pk, &mut conn).await?;
                             return Ok((conn, false));
                         }
@@ -199,6 +208,7 @@ impl Client {
             peer_nat_type,
             my_nat_type,
             is_local,
+            conn_type,
         )
         .await
     }
@@ -214,8 +224,9 @@ impl Client {
         peer_nat_type: NatType,
         my_nat_type: i32,
         is_local: bool,
+        conn_type: ConnType,
     ) -> ResultType<(Stream, bool)> {
-        let mut direct_failures = 0;
+        let direct_failures = PeerConfig::load(peer_id).direct_failures;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
         if is_local || peer_nat_type == NatType::SYMMETRIC {
@@ -231,13 +242,14 @@ impl Client {
                     }
                     if my_nat_type == NatType::ASYMMETRIC as i32 {
                         connect_timeout = CONNECT_TIMEOUT;
+                        if direct_failures > 0 {
+                            connect_timeout = punch_time_used * 6;
+                        }
                     } else if my_nat_type == NatType::SYMMETRIC as i32 {
                         connect_timeout = MIN;
                     }
                 }
                 if connect_timeout == 0 {
-                    let config = PeerConfig::load(peer_id);
-                    direct_failures = config.direct_failures;
                     let n = if direct_failures > 0 { 3 } else { 6 };
                     connect_timeout = punch_time_used * (n as u64);
                 }
@@ -257,10 +269,14 @@ impl Client {
                     relay_server.to_owned(),
                     rendezvous_server,
                     pk.len() == sign::PUBLICKEYBYTES,
+                    conn_type,
                 )
                 .await;
                 if conn.is_err() {
-                    bail!("Failed to connect via relay server");
+                    bail!(
+                        "Failed to connect via relay server: {}",
+                        conn.err().unwrap()
+                    );
                 }
             } else {
                 bail!("Failed to make direct connection to remote desktop");
@@ -318,6 +334,7 @@ impl Client {
                             }
                         } else {
                             // fall back to non-secure connection in case pk mismatch
+                            log::info!("pk mismatch, fall back to non-secure");
                             let mut msg_out = Message::new();
                             msg_out.set_public_key(PublicKey::new());
                             timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
@@ -341,6 +358,7 @@ impl Client {
         relay_server: String,
         rendezvous_server: SocketAddr,
         secure: bool,
+        conn_type: ConnType,
     ) -> ResultType<Stream> {
         let any_addr = Config::get_any_listen_addr();
         let mut succeed = false;
@@ -368,9 +386,12 @@ impl Client {
                 ..Default::default()
             });
             socket.send(&msg_out).await?;
-            if let Some(Ok(bytes)) = socket.next_timeout(i * 3000).await {
+            if let Some(Ok(bytes)) = socket.next_timeout(CONNECT_TIMEOUT).await {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    if let Some(rendezvous_message::Union::relay_response(_)) = msg_in.union {
+                    if let Some(rendezvous_message::Union::relay_response(rs)) = msg_in.union {
+                        if !rs.refuse_reason.is_empty() {
+                            bail!(rs.refuse_reason);
+                        }
                         succeed = true;
                         break;
                     }
@@ -378,12 +399,17 @@ impl Client {
             }
         }
         if !succeed {
-            bail!("");
+            bail!("Timeout");
         }
-        Self::create_relay(peer, uuid, relay_server).await
+        Self::create_relay(peer, uuid, relay_server, conn_type).await
     }
 
-    async fn create_relay(peer: &str, uuid: String, relay_server: String) -> ResultType<Stream> {
+    async fn create_relay(
+        peer: &str,
+        uuid: String,
+        relay_server: String,
+        conn_type: ConnType,
+    ) -> ResultType<Stream> {
         let mut conn = FramedStream::new(
             crate::check_port(relay_server, RELAY_PORT),
             Config::get_any_listen_addr(),
@@ -395,6 +421,7 @@ impl Client {
         msg_out.set_request_relay(RequestRelay {
             id: peer.to_owned(),
             uuid,
+            conn_type: conn_type.into(),
             ..Default::default()
         });
         conn.send(&msg_out).await?;
@@ -1068,7 +1095,7 @@ lazy_static::lazy_static! {
         ("VK_RETURN", Key::ControlKey(ControlKey::Return)),
         ("VK_SHIFT", Key::ControlKey(ControlKey::Shift)),
         ("VK_CONTROL", Key::ControlKey(ControlKey::Control)),
-        ("VK_MENU", Key::ControlKey(ControlKey::Menu)),
+        ("VK_MENU", Key::ControlKey(ControlKey::Alt)),
         ("VK_PAUSE", Key::ControlKey(ControlKey::Pause)),
         ("VK_CAPITAL", Key::ControlKey(ControlKey::CapsLock)),
         ("VK_KANA", Key::ControlKey(ControlKey::Kana)),
@@ -1107,7 +1134,26 @@ lazy_static::lazy_static! {
         ("VK_NUMPAD7", Key::ControlKey(ControlKey::Numpad7)),
         ("VK_NUMPAD8", Key::ControlKey(ControlKey::Numpad8)),
         ("VK_NUMPAD9", Key::ControlKey(ControlKey::Numpad9)),
+        ("Apps", Key::ControlKey(ControlKey::Apps)),
+        ("Meta", Key::ControlKey(ControlKey::Meta)),
+        ("RAlt", Key::ControlKey(ControlKey::RAlt)),
+        ("RWin", Key::ControlKey(ControlKey::RWin)),
+        ("RControl", Key::ControlKey(ControlKey::RControl)),
+        ("RShift", Key::ControlKey(ControlKey::RShift)),
         ("CTRL_ALT_DEL", Key::ControlKey(ControlKey::CtrlAltDel)),
         ("LOCK_SCREEN", Key::ControlKey(ControlKey::LockScreen)),
     ].iter().cloned().collect();
+}
+
+#[inline]
+pub fn check_if_retry(msgtype: &str, title: &str, text: &str) -> bool {
+    msgtype == "error"
+        && title == "Connection Error"
+        && !text.to_lowercase().contains("offline")
+        && !text.to_lowercase().contains("exist")
+        && !text.to_lowercase().contains("handshake")
+        && !text.to_lowercase().contains("failed")
+        && !text.to_lowercase().contains("resolve")
+        && !text.to_lowercase().contains("mismatch")
+        && !text.to_lowercase().contains("manually")
 }

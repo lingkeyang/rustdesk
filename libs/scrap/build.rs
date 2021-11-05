@@ -12,25 +12,21 @@ fn find_package(name: &str) -> Vec<PathBuf> {
         target_arch = "x64".to_owned();
     } else if target_arch == "aarch64" {
         target_arch = "arm64".to_owned();
-    } else {
-        target_arch = "arm".to_owned();
     }
-    let target = if target_os == "macos" {
+    let mut target = if target_os == "macos" {
         "x64-osx".to_owned()
     } else if target_os == "windows" {
         "x64-windows-static".to_owned()
-    } else if target_os == "android" {
-        format!("{}-android-static", target_arch)
     } else {
-        "x64-linux".to_owned()
+        format!("{}-{}", target_arch, target_os)
     };
+    if target_arch == "x86" {
+        target = target.replace("x64", "x86");
+    }
     println!("cargo:info={}", target);
     path.push("installed");
     path.push(target);
-    let mut lib = name.trim_start_matches("lib").to_string();
-    if lib == "vpx" && target_os == "windows" {
-        lib = format!("{}mt", lib);
-    }
+    let lib = name.trim_start_matches("lib").to_string();
     println!("{}", format!("cargo:rustc-link-lib=static={}", lib));
     println!(
         "{}",
@@ -52,9 +48,9 @@ fn generate_bindings(
 ) {
     let mut b = bindgen::builder()
         .header(ffi_header.to_str().unwrap())
-        .whitelist_type("^[vV].*")
-        .whitelist_var("^[vV].*")
-        .whitelist_function("^[vV].*")
+        .allowlist_type("^[vV].*")
+        .allowlist_var("^[vV].*")
+        .allowlist_function("^[vV].*")
         .rustified_enum("^v.*")
         .trust_clang_mangling(false)
         .layout_tests(false) // breaks 32/64-bit compat
@@ -93,7 +89,7 @@ fn main() {
     // then set x64 to default by "rustup default stable-x86_64-pc-windows-msvc"
     let target = target_build_utils::TargetInfo::new();
     if target.unwrap().target_pointer_width() != "64" {
-        panic!("Only support 64bit system");
+        // panic!("Only support 64bit system");
     }
     env::remove_var("CARGO_CFG_TARGET_FEATURE");
     env::set_var("CARGO_CFG_TARGET_FEATURE", "crt-static");
