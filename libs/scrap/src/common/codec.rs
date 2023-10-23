@@ -1,536 +1,556 @@
-// https://github.com/astraw/vpx-encode
-// https://github.com/astraw/env-libvpx-sys
-// https://github.com/rust-av/vpx-rs/blob/master/src/decoder.rs
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex},
+};
 
-use super::vpx::{vp8e_enc_control_id::*, vpx_codec_err_t::*, *};
-use std::os::raw::{c_int, c_uint};
-use std::{ptr, slice};
+#[cfg(feature = "hwcodec")]
+use crate::hwcodec::*;
+#[cfg(feature = "mediacodec")]
+use crate::mediacodec::{
+    MediaCodecDecoder, MediaCodecDecoders, H264_DECODER_SUPPORT, H265_DECODER_SUPPORT,
+};
+use crate::{
+    aom::{self, AomDecoder, AomEncoder, AomEncoderConfig},
+    common::GoogleImage,
+    vpxcodec::{self, VpxDecoder, VpxDecoderConfig, VpxEncoder, VpxEncoderConfig, VpxVideoCodecId},
+    CodecName, ImageRgb,
+};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum VideoCodecId {
-    VP8,
-    VP9,
+use hbb_common::{
+    anyhow::anyhow,
+    bail,
+    config::PeerConfig,
+    log,
+    message_proto::{
+        supported_decoding::PreferCodec, video_frame, EncodedVideoFrames,
+        SupportedDecoding, SupportedEncoding, VideoFrame,
+    },
+    sysinfo::{System, SystemExt},
+    tokio::time::Instant,
+    ResultType,
+};
+#[cfg(any(feature = "hwcodec", feature = "mediacodec"))]
+use hbb_common::{config::Config2, lazy_static};
+
+lazy_static::lazy_static! {
+    static ref PEER_DECODINGS: Arc<Mutex<HashMap<i32, SupportedDecoding>>> = Default::default();
+    static ref CODEC_NAME: Arc<Mutex<CodecName>> = Arc::new(Mutex::new(CodecName::VP9));
+    static ref THREAD_LOG_TIME: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 }
 
-impl Default for VideoCodecId {
-    fn default() -> VideoCodecId {
-        VideoCodecId::VP9
-    }
+#[derive(Debug, Clone)]
+pub struct HwEncoderConfig {
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    pub quality: Quality,
+    pub keyframe_interval: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EncoderCfg {
+    VPX(VpxEncoderConfig),
+    AOM(AomEncoderConfig),
+    HW(HwEncoderConfig),
+}
+
+pub trait EncoderApi {
+    fn new(cfg: EncoderCfg) -> ResultType<Self>
+    where
+        Self: Sized;
+
+    fn encode_to_message(&mut self, frame: &[u8], ms: i64) -> ResultType<VideoFrame>;
+
+    fn use_yuv(&self) -> bool;
+
+    fn set_quality(&mut self, quality: Quality) -> ResultType<()>;
+
+    fn bitrate(&self) -> u32;
 }
 
 pub struct Encoder {
-    ctx: vpx_codec_ctx_t,
-    width: usize,
-    height: usize,
+    pub codec: Box<dyn EncoderApi>,
+}
+
+impl Deref for Encoder {
+    type Target = Box<dyn EncoderApi>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.codec
+    }
+}
+
+impl DerefMut for Encoder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.codec
+    }
 }
 
 pub struct Decoder {
-    ctx: vpx_codec_ctx_t,
+    vp8: Option<VpxDecoder>,
+    vp9: Option<VpxDecoder>,
+    av1: Option<AomDecoder>,
+    #[cfg(feature = "hwcodec")]
+    hw: HwDecoders,
+    #[cfg(feature = "hwcodec")]
+    i420: Vec<u8>,
+    #[cfg(feature = "mediacodec")]
+    media_codec: MediaCodecDecoders,
 }
 
-#[derive(Debug)]
-pub enum Error {
-    FailedCall(String),
-    BadPtr(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-macro_rules! call_vpx {
-    ($x:expr) => {{
-        let result = unsafe { $x }; // original expression
-        let result_int = unsafe { std::mem::transmute::<_, i32>(result) };
-        if result_int != 0 {
-            return Err(Error::FailedCall(format!(
-                "errcode={} {}:{}:{}:{}",
-                result_int,
-                module_path!(),
-                file!(),
-                line!(),
-                column!()
-            ))
-            .into());
-        }
-        result
-    }};
-}
-
-macro_rules! call_vpx_ptr {
-    ($x:expr) => {{
-        let result = unsafe { $x }; // original expression
-        let result_int = unsafe { std::mem::transmute::<_, isize>(result) };
-        if result_int == 0 {
-            return Err(Error::BadPtr(format!(
-                "errcode={} {}:{}:{}:{}",
-                result_int,
-                module_path!(),
-                file!(),
-                line!(),
-                column!()
-            ))
-            .into());
-        }
-        result
-    }};
+#[derive(Debug, Clone)]
+pub enum EncodingUpdate {
+    New(SupportedDecoding),
+    Remove,
+    NewOnlyVP9,
 }
 
 impl Encoder {
-    pub fn new(config: &Config, num_threads: u32) -> Result<Self> {
-        let i;
-        if cfg!(feature = "VP8") {
-            i = match config.codec {
-                VideoCodecId::VP8 => call_vpx_ptr!(vpx_codec_vp8_cx()),
-                VideoCodecId::VP9 => call_vpx_ptr!(vpx_codec_vp9_cx()),
-            };
-        } else {
-            i = call_vpx_ptr!(vpx_codec_vp9_cx());
+    pub fn new(config: EncoderCfg) -> ResultType<Encoder> {
+        log::info!("new encoder:{:?}", config);
+        match config {
+            EncoderCfg::VPX(_) => Ok(Encoder {
+                codec: Box::new(VpxEncoder::new(config)?),
+            }),
+            EncoderCfg::AOM(_) => Ok(Encoder {
+                codec: Box::new(AomEncoder::new(config)?),
+            }),
+
+            #[cfg(feature = "hwcodec")]
+            EncoderCfg::HW(_) => match HwEncoder::new(config) {
+                Ok(hw) => Ok(Encoder {
+                    codec: Box::new(hw),
+                }),
+                Err(e) => {
+                    check_config_process();
+                    *CODEC_NAME.lock().unwrap() = CodecName::VP9;
+                    Err(e)
+                }
+            },
+            #[cfg(not(feature = "hwcodec"))]
+            _ => Err(anyhow!("unsupported encoder type")),
         }
-        let mut c = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        call_vpx!(vpx_codec_enc_config_default(i, &mut c, 0));
-
-        // https://www.webmproject.org/docs/encoder-parameters/
-        // default: c.rc_min_quantizer = 0, c.rc_max_quantizer = 63
-        // try rc_resize_allowed later
-
-        c.g_w = config.width;
-        c.g_h = config.height;
-        c.g_timebase.num = config.timebase[0];
-        c.g_timebase.den = config.timebase[1];
-        c.rc_target_bitrate = config.bitrate;
-        c.rc_undershoot_pct = 95;
-        c.rc_dropframe_thresh = 25;
-        if config.rc_min_quantizer > 0 {
-            c.rc_min_quantizer = config.rc_min_quantizer;
-        }
-        if config.rc_max_quantizer > 0 {
-            c.rc_max_quantizer = config.rc_max_quantizer;
-        }
-        let mut speed = config.speed;
-        if speed <= 0 {
-            speed = 6;
-        }
-
-        c.g_threads = if num_threads == 0 {
-            num_cpus::get() as _
-        } else {
-            num_threads
-        };
-        c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
-        // https://developers.google.com/media/vp9/bitrate-modes/
-        // Constant Bitrate mode (CBR) is recommended for live streaming with VP9.
-        c.rc_end_usage = vpx_rc_mode::VPX_CBR;
-        // c.kf_min_dist = 0;
-        // c.kf_max_dist = 999999;
-        c.kf_mode = vpx_kf_mode::VPX_KF_DISABLED; // reduce bandwidth a lot
-
-        /*
-        VPX encoder支持two-pass encode，这是为了rate control的。
-        对于两遍编码，就是需要整个编码过程做两次，第一次会得到一些新的控制参数来进行第二遍的编码，
-        这样可以在相同的bitrate下得到最好的PSNR
-        */
-
-        let mut ctx = Default::default();
-        call_vpx!(vpx_codec_enc_init_ver(
-            &mut ctx,
-            i,
-            &c,
-            0,
-            VPX_ENCODER_ABI_VERSION as _
-        ));
-
-        if config.codec == VideoCodecId::VP9 {
-            // set encoder internal speed settings
-            // in ffmpeg, it is --speed option
-            /*
-            set to 0 or a positive value 1-16, the codec will try to adapt its
-            complexity depending on the time it spends encoding. Increasing this
-            number will make the speed go up and the quality go down.
-            Negative values mean strict enforcement of this
-            while positive values are adaptive
-            */
-            /* https://developers.google.com/media/vp9/live-encoding
-            Speed 5 to 8 should be used for live / real-time encoding.
-            Lower numbers (5 or 6) are higher quality but require more CPU power.
-            Higher numbers (7 or 8) will be lower quality but more manageable for lower latency
-            use cases and also for lower CPU power devices such as mobile.
-            */
-            call_vpx!(vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as _, speed,));
-            // set row level multi-threading
-            /*
-            as some people in comments and below have already commented,
-            more recent versions of libvpx support -row-mt 1 to enable tile row
-            multi-threading. This can increase the number of tiles by up to 4x in VP9
-            (since the max number of tile rows is 4, regardless of video height).
-            To enable this, use -tile-rows N where N is the number of tile rows in
-            log2 units (so -tile-rows 1 means 2 tile rows and -tile-rows 2 means 4 tile
-            rows). The total number of active threads will then be equal to
-            $tile_rows * $tile_columns
-            */
-            call_vpx!(vpx_codec_control_(
-                &mut ctx,
-                VP9E_SET_ROW_MT as _,
-                1 as c_int
-            ));
-
-            call_vpx!(vpx_codec_control_(
-                &mut ctx,
-                VP9E_SET_TILE_COLUMNS as _,
-                4 as c_int
-            ));
-        }
-
-        Ok(Self {
-            ctx,
-            width: config.width as _,
-            height: config.height as _,
-        })
     }
 
-    pub fn encode(&mut self, pts: i64, data: &[u8], stride_align: usize) -> Result<EncodeFrames> {
-        assert!(2 * data.len() >= 3 * self.width * self.height);
-
-        let mut image = Default::default();
-        call_vpx_ptr!(vpx_img_wrap(
-            &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_I420,
-            self.width as _,
-            self.height as _,
-            stride_align as _,
-            data.as_ptr() as _,
-        ));
-
-        call_vpx!(vpx_codec_encode(
-            &mut self.ctx,
-            &image,
-            pts as _,
-            1, // Duration
-            0, // Flags
-            VPX_DL_REALTIME as _,
-        ));
-
-        Ok(EncodeFrames {
-            ctx: &mut self.ctx,
-            iter: ptr::null(),
-        })
-    }
-
-    /// Notify the encoder to return any pending packets
-    pub fn flush(&mut self) -> Result<EncodeFrames> {
-        call_vpx!(vpx_codec_encode(
-            &mut self.ctx,
-            ptr::null(),
-            -1, // PTS
-            1,  // Duration
-            0,  // Flags
-            VPX_DL_REALTIME as _,
-        ));
-
-        Ok(EncodeFrames {
-            ctx: &mut self.ctx,
-            iter: ptr::null(),
-        })
-    }
-}
-
-impl Drop for Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            let result = vpx_codec_destroy(&mut self.ctx);
-            if result != VPX_CODEC_OK {
-                panic!("failed to destroy vpx codec");
+    pub fn update(id: i32, update: EncodingUpdate) {
+        let mut decodings = PEER_DECODINGS.lock().unwrap();
+        match update {
+            EncodingUpdate::New(decoding) => {
+                decodings.insert(id, decoding);
+            }
+            EncodingUpdate::Remove => {
+                decodings.remove(&id);
+            }
+            EncodingUpdate::NewOnlyVP9 => {
+                decodings.insert(
+                    id,
+                    SupportedDecoding {
+                        ability_vp9: 1,
+                        ..Default::default()
+                    },
+                );
             }
         }
-    }
-}
 
-#[derive(Clone, Copy, Debug)]
-pub struct EncodeFrame<'a> {
-    /// Compressed data.
-    pub data: &'a [u8],
-    /// Whether the frame is a keyframe.
-    pub key: bool,
-    /// Presentation timestamp (in timebase units).
-    pub pts: i64,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Config {
-    /// The width (in pixels).
-    pub width: c_uint,
-    /// The height (in pixels).
-    pub height: c_uint,
-    /// The timebase numerator and denominator (in seconds).
-    pub timebase: [c_int; 2],
-    /// The target bitrate (in kilobits per second).
-    pub bitrate: c_uint,
-    /// The codec
-    pub codec: VideoCodecId,
-    pub rc_min_quantizer: u32,
-    pub rc_max_quantizer: u32,
-    pub speed: i32,
-}
-
-pub struct EncodeFrames<'a> {
-    ctx: &'a mut vpx_codec_ctx_t,
-    iter: vpx_codec_iter_t,
-}
-
-impl<'a> Iterator for EncodeFrames<'a> {
-    type Item = EncodeFrame<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            unsafe {
-                let pkt = vpx_codec_get_cx_data(self.ctx, &mut self.iter);
-                if pkt.is_null() {
-                    return None;
-                } else if (*pkt).kind == vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT {
-                    let f = &(*pkt).data.frame;
-                    return Some(Self::Item {
-                        data: slice::from_raw_parts(f.buf as _, f.sz as _),
-                        key: (f.flags & VPX_FRAME_IS_KEY) != 0,
-                        pts: f.pts,
-                    });
-                } else {
-                    // Ignore the packet.
+        let vp8_useable = decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_vp8 > 0);
+        let av1_useable = decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_av1 > 0);
+        #[allow(unused_mut)]
+        let mut h264_name = None;
+        #[allow(unused_mut)]
+        let mut h265_name = None;
+        #[cfg(feature = "hwcodec")]
+        {
+            if enable_hwcodec_option() {
+                let best = HwEncoder::best();
+                let h264_useable =
+                    decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h264 > 0);
+                let h265_useable =
+                    decodings.len() > 0 && decodings.iter().all(|(_, s)| s.ability_h265 > 0);
+                if h264_useable {
+                    h264_name = best.h264.map_or(None, |c| Some(c.name));
+                }
+                if h265_useable {
+                    h265_name = best.h265.map_or(None, |c| Some(c.name));
                 }
             }
         }
+
+        let mut name = CODEC_NAME.lock().unwrap();
+        let mut preference = PreferCodec::Auto;
+        let preferences: Vec<_> = decodings
+            .iter()
+            .filter(|(_, s)| {
+                s.prefer == PreferCodec::VP9.into()
+                    || s.prefer == PreferCodec::VP8.into() && vp8_useable
+                    || s.prefer == PreferCodec::AV1.into() && av1_useable
+                    || s.prefer == PreferCodec::H264.into() && h264_name.is_some()
+                    || s.prefer == PreferCodec::H265.into() && h265_name.is_some()
+            })
+            .map(|(_, s)| s.prefer)
+            .collect();
+        if preferences.len() > 0 && preferences.iter().all(|&p| p == preferences[0]) {
+            preference = preferences[0].enum_value_or(PreferCodec::Auto);
+        }
+
+        #[allow(unused_mut)]
+        let mut auto_codec = CodecName::VP9;
+        if av1_useable {
+            auto_codec = CodecName::AV1;
+        }
+        if vp8_useable && System::new_all().total_memory() <= 4 * 1024 * 1024 * 1024 {
+            // 4 Gb
+            auto_codec = CodecName::VP8
+        }
+
+        match preference {
+            PreferCodec::VP8 => *name = CodecName::VP8,
+            PreferCodec::VP9 => *name = CodecName::VP9,
+            PreferCodec::AV1 => *name = CodecName::AV1,
+            PreferCodec::H264 => *name = h264_name.map_or(auto_codec, |c| CodecName::H264(c)),
+            PreferCodec::H265 => *name = h265_name.map_or(auto_codec, |c| CodecName::H265(c)),
+            PreferCodec::Auto => *name = auto_codec,
+        }
+
+        log::info!(
+            "connection count:{}, used preference:{:?}, encoder:{:?}",
+            decodings.len(),
+            preference,
+            *name
+        )
+    }
+
+    #[inline]
+    pub fn negotiated_codec() -> CodecName {
+        CODEC_NAME.lock().unwrap().clone()
+    }
+
+    pub fn supported_encoding() -> SupportedEncoding {
+        #[allow(unused_mut)]
+        let mut encoding = SupportedEncoding {
+            vp8: true,
+            av1: true,
+            ..Default::default()
+        };
+        #[cfg(feature = "hwcodec")]
+        if enable_hwcodec_option() {
+            let best = HwEncoder::best();
+            encoding.h264 = best.h264.is_some();
+            encoding.h265 = best.h265.is_some();
+        }
+        encoding
     }
 }
 
 impl Decoder {
-    /// Create a new decoder
-    ///
-    /// # Errors
-    ///
-    /// The function may fail if the underlying libvpx does not provide
-    /// the VP9 decoder.
-    pub fn new(codec: VideoCodecId, num_threads: u32) -> Result<Self> {
-        // This is sound because `vpx_codec_ctx` is a repr(C) struct without any field that can
-        // cause UB if uninitialized.
-        let i;
-        if cfg!(feature = "VP8") {
-            i = match codec {
-                VideoCodecId::VP8 => call_vpx_ptr!(vpx_codec_vp8_dx()),
-                VideoCodecId::VP9 => call_vpx_ptr!(vpx_codec_vp9_dx()),
-            };
-        } else {
-            i = call_vpx_ptr!(vpx_codec_vp9_dx());
-        }
-        let mut ctx = Default::default();
-        let cfg = vpx_codec_dec_cfg_t {
-            threads: if num_threads == 0 {
-                num_cpus::get() as _
-            } else {
-                num_threads
-            },
-            w: 0,
-            h: 0,
+    pub fn supported_decodings(id_for_perfer: Option<&str>) -> SupportedDecoding {
+        #[allow(unused_mut)]
+        let mut decoding = SupportedDecoding {
+            ability_vp8: 1,
+            ability_vp9: 1,
+            ability_av1: 1,
+            prefer: id_for_perfer
+                .map_or(PreferCodec::Auto, |id| Self::codec_preference(id))
+                .into(),
+            ..Default::default()
         };
-        /*
-        unsafe {
-            println!("{}", vpx_codec_get_caps(i));
+        #[cfg(feature = "hwcodec")]
+        if enable_hwcodec_option() {
+            let best = HwDecoder::best();
+            decoding.ability_h264 = if best.h264.is_some() { 1 } else { 0 };
+            decoding.ability_h265 = if best.h265.is_some() { 1 } else { 0 };
         }
-        */
-        call_vpx!(vpx_codec_dec_init_ver(
-            &mut ctx,
-            i,
-            &cfg,
-            0,
-            VPX_DECODER_ABI_VERSION as _,
-        ));
-        Ok(Self { ctx })
+        #[cfg(feature = "mediacodec")]
+        if enable_hwcodec_option() {
+            decoding.ability_h264 =
+                if H264_DECODER_SUPPORT.load(std::sync::atomic::Ordering::SeqCst) {
+                    1
+                } else {
+                    0
+                };
+            decoding.ability_h265 =
+                if H265_DECODER_SUPPORT.load(std::sync::atomic::Ordering::SeqCst) {
+                    1
+                } else {
+                    0
+                };
+        }
+        decoding
     }
 
-    pub fn decode2rgb(&mut self, data: &[u8], rgba: bool) -> Result<Vec<u8>> {
-        let mut img = Image::new();
-        for frame in self.decode(data)? {
-            drop(img);
-            img = frame;
-        }
-        for frame in self.flush()? {
-            drop(img);
-            img = frame;
-        }
-        if img.is_null() {
-            Ok(Vec::new())
-        } else {
-            let mut out = Default::default();
-            img.rgb(1, rgba, &mut out);
-            Ok(out)
-        }
-    }
-
-    /// Feed some compressed data to the encoder
-    ///
-    /// The `data` slice is sent to the decoder
-    ///
-    /// It matches a call to `vpx_codec_decode`.
-    pub fn decode(&mut self, data: &[u8]) -> Result<DecodeFrames> {
-        call_vpx!(vpx_codec_decode(
-            &mut self.ctx,
-            data.as_ptr(),
-            data.len() as _,
-            ptr::null_mut(),
-            0,
-        ));
-
-        Ok(DecodeFrames {
-            ctx: &mut self.ctx,
-            iter: ptr::null(),
+    pub fn new() -> Decoder {
+        let vp8 = VpxDecoder::new(VpxDecoderConfig {
+            codec: VpxVideoCodecId::VP8,
         })
-    }
-
-    /// Notify the decoder to return any pending frame
-    pub fn flush(&mut self) -> Result<DecodeFrames> {
-        call_vpx!(vpx_codec_decode(
-            &mut self.ctx,
-            ptr::null(),
-            0,
-            ptr::null_mut(),
-            0
-        ));
-        Ok(DecodeFrames {
-            ctx: &mut self.ctx,
-            iter: ptr::null(),
+        .ok();
+        let vp9 = VpxDecoder::new(VpxDecoderConfig {
+            codec: VpxVideoCodecId::VP9,
         })
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        unsafe {
-            let result = vpx_codec_destroy(&mut self.ctx);
-            if result != VPX_CODEC_OK {
-                panic!("failed to destroy vpx codec");
-            }
-        }
-    }
-}
-
-pub struct DecodeFrames<'a> {
-    ctx: &'a mut vpx_codec_ctx_t,
-    iter: vpx_codec_iter_t,
-}
-
-impl<'a> Iterator for DecodeFrames<'a> {
-    type Item = Image;
-    fn next(&mut self) -> Option<Self::Item> {
-        let img = unsafe { vpx_codec_get_frame(self.ctx, &mut self.iter) };
-        if img.is_null() {
-            return None;
-        } else {
-            return Some(Image(img));
-        }
-    }
-}
-
-// https://chromium.googlesource.com/webm/libvpx/+/bali/vpx/src/vpx_image.c
-pub struct Image(*mut vpx_image_t);
-impl Image {
-    #[inline]
-    pub fn new() -> Self {
-        Self(std::ptr::null_mut())
-    }
-
-    #[inline]
-    pub fn is_null(&self) -> bool {
-        self.0.is_null()
-    }
-
-    #[inline]
-    pub fn width(&self) -> usize {
-        self.inner().d_w as _
-    }
-
-    #[inline]
-    pub fn height(&self) -> usize {
-        self.inner().d_h as _
-    }
-
-    #[inline]
-    pub fn format(&self) -> vpx_img_fmt_t {
-        // VPX_IMG_FMT_I420
-        self.inner().fmt
-    }
-
-    #[inline]
-    pub fn inner(&self) -> &vpx_image_t {
-        unsafe { &*self.0 }
-    }
-
-    #[inline]
-    pub fn stride(&self, iplane: usize) -> i32 {
-        self.inner().stride[iplane]
-    }
-
-    pub fn rgb(&self, stride_align: usize, rgba: bool, dst: &mut Vec<u8>) {
-        let h = self.height();
-        let mut w = self.width();
-        let bps = if rgba { 4 } else { 3 };
-        w = (w + stride_align - 1) & !(stride_align - 1);
-        dst.resize(h * w * bps, 0);
-        let img = self.inner();
-        unsafe {
-            if rgba {
-                super::I420ToARGB(
-                    img.planes[0],
-                    img.stride[0],
-                    img.planes[1],
-                    img.stride[1],
-                    img.planes[2],
-                    img.stride[2],
-                    dst.as_mut_ptr(),
-                    (w * bps) as _,
-                    self.width() as _,
-                    self.height() as _,
-                );
+        .ok();
+        let av1 = AomDecoder::new().ok();
+        Decoder {
+            vp8,
+            vp9,
+            av1,
+            #[cfg(feature = "hwcodec")]
+            hw: if enable_hwcodec_option() {
+                HwDecoder::new_decoders()
             } else {
-                super::I420ToRAW(
-                    img.planes[0],
-                    img.stride[0],
-                    img.planes[1],
-                    img.stride[1],
-                    img.planes[2],
-                    img.stride[2],
-                    dst.as_mut_ptr(),
-                    (w * bps) as _,
-                    self.width() as _,
-                    self.height() as _,
-                );
+                HwDecoders::default()
+            },
+            #[cfg(feature = "hwcodec")]
+            i420: vec![],
+            #[cfg(feature = "mediacodec")]
+            media_codec: if enable_hwcodec_option() {
+                MediaCodecDecoder::new_decoders()
+            } else {
+                MediaCodecDecoders::default()
+            },
+        }
+    }
+
+    // rgb [in/out] fmt and stride must be set in ImageRgb
+    pub fn handle_video_frame(
+        &mut self,
+        frame: &video_frame::Union,
+        rgb: &mut ImageRgb,
+    ) -> ResultType<bool> {
+        match frame {
+            video_frame::Union::Vp8s(vp8s) => {
+                if let Some(vp8) = &mut self.vp8 {
+                    Decoder::handle_vpxs_video_frame(vp8, vp8s, rgb)
+                } else {
+                    bail!("vp8 decoder not available");
+                }
+            }
+            video_frame::Union::Vp9s(vp9s) => {
+                if let Some(vp9) = &mut self.vp9 {
+                    Decoder::handle_vpxs_video_frame(vp9, vp9s, rgb)
+                } else {
+                    bail!("vp9 decoder not available");
+                }
+            }
+            video_frame::Union::Av1s(av1s) => {
+                if let Some(av1) = &mut self.av1 {
+                    Decoder::handle_av1s_video_frame(av1, av1s, rgb)
+                } else {
+                    bail!("av1 decoder not available");
+                }
+            }
+            #[cfg(feature = "hwcodec")]
+            video_frame::Union::H264s(h264s) => {
+                if let Some(decoder) = &mut self.hw.h264 {
+                    Decoder::handle_hw_video_frame(decoder, h264s, rgb, &mut self.i420)
+                } else {
+                    Err(anyhow!("don't support h264!"))
+                }
+            }
+            #[cfg(feature = "hwcodec")]
+            video_frame::Union::H265s(h265s) => {
+                if let Some(decoder) = &mut self.hw.h265 {
+                    Decoder::handle_hw_video_frame(decoder, h265s, rgb, &mut self.i420)
+                } else {
+                    Err(anyhow!("don't support h265!"))
+                }
+            }
+            #[cfg(feature = "mediacodec")]
+            video_frame::Union::H264s(h264s) => {
+                if let Some(decoder) = &mut self.media_codec.h264 {
+                    Decoder::handle_mediacodec_video_frame(decoder, h264s, rgb)
+                } else {
+                    Err(anyhow!("don't support h264!"))
+                }
+            }
+            #[cfg(feature = "mediacodec")]
+            video_frame::Union::H265s(h265s) => {
+                if let Some(decoder) = &mut self.media_codec.h265 {
+                    Decoder::handle_mediacodec_video_frame(decoder, h265s, rgb)
+                } else {
+                    Err(anyhow!("don't support h265!"))
+                }
+            }
+            _ => Err(anyhow!("unsupported video frame type!")),
+        }
+    }
+
+    // rgb [in/out] fmt and stride must be set in ImageRgb
+    fn handle_vpxs_video_frame(
+        decoder: &mut VpxDecoder,
+        vpxs: &EncodedVideoFrames,
+        rgb: &mut ImageRgb,
+    ) -> ResultType<bool> {
+        let mut last_frame = vpxcodec::Image::new();
+        for vpx in vpxs.frames.iter() {
+            for frame in decoder.decode(&vpx.data)? {
+                drop(last_frame);
+                last_frame = frame;
+            }
+        }
+        for frame in decoder.flush()? {
+            drop(last_frame);
+            last_frame = frame;
+        }
+        if last_frame.is_null() {
+            Ok(false)
+        } else {
+            last_frame.to(rgb);
+            Ok(true)
+        }
+    }
+
+    // rgb [in/out] fmt and stride must be set in ImageRgb
+    fn handle_av1s_video_frame(
+        decoder: &mut AomDecoder,
+        av1s: &EncodedVideoFrames,
+        rgb: &mut ImageRgb,
+    ) -> ResultType<bool> {
+        let mut last_frame = aom::Image::new();
+        for av1 in av1s.frames.iter() {
+            for frame in decoder.decode(&av1.data)? {
+                drop(last_frame);
+                last_frame = frame;
+            }
+        }
+        for frame in decoder.flush()? {
+            drop(last_frame);
+            last_frame = frame;
+        }
+        if last_frame.is_null() {
+            Ok(false)
+        } else {
+            last_frame.to(rgb);
+            Ok(true)
+        }
+    }
+
+    // rgb [in/out] fmt and stride must be set in ImageRgb
+    #[cfg(feature = "hwcodec")]
+    fn handle_hw_video_frame(
+        decoder: &mut HwDecoder,
+        frames: &EncodedVideoFrames,
+        rgb: &mut ImageRgb,
+        i420: &mut Vec<u8>,
+    ) -> ResultType<bool> {
+        let mut ret = false;
+        for h264 in frames.frames.iter() {
+            for image in decoder.decode(&h264.data)? {
+                // TODO: just process the last frame
+                if image.to_fmt(rgb, i420).is_ok() {
+                    ret = true;
+                }
+            }
+        }
+        return Ok(ret);
+    }
+
+    // rgb [in/out] fmt and stride must be set in ImageRgb
+    #[cfg(feature = "mediacodec")]
+    fn handle_mediacodec_video_frame(
+        decoder: &mut MediaCodecDecoder,
+        frames: &EncodedVideoFrames,
+        rgb: &mut ImageRgb,
+    ) -> ResultType<bool> {
+        let mut ret = false;
+        for h264 in frames.frames.iter() {
+            return decoder.decode(&h264.data, rgb);
+        }
+        return Ok(false);
+    }
+
+    fn codec_preference(id: &str) -> PreferCodec {
+        let codec = PeerConfig::load(id)
+            .options
+            .get("codec-preference")
+            .map_or("".to_owned(), |c| c.to_owned());
+        if codec == "vp8" {
+            PreferCodec::VP8
+        } else if codec == "vp9" {
+            PreferCodec::VP9
+        } else if codec == "av1" {
+            PreferCodec::AV1
+        } else if codec == "h264" {
+            PreferCodec::H264
+        } else if codec == "h265" {
+            PreferCodec::H265
+        } else {
+            PreferCodec::Auto
+        }
+    }
+}
+
+#[cfg(any(feature = "hwcodec", feature = "mediacodec"))]
+fn enable_hwcodec_option() -> bool {
+    if let Some(v) = Config2::get().options.get("enable-hwcodec") {
+        return v != "N";
+    }
+    return true; // default is true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    Best,
+    Balanced,
+    Low,
+    Custom(u32),
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+pub fn base_bitrate(width: u32, height: u32) -> u32 {
+    #[allow(unused_mut)]
+    let mut base_bitrate = ((width * height) / 1000) as u32; // same as 1.1.9
+    if base_bitrate == 0 {
+        base_bitrate = 1920 * 1080 / 1000;
+    }
+    #[cfg(target_os = "android")]
+    {
+        // fix when android screen shrinks
+        let fix = crate::Display::fix_quality() as u32;
+        log::debug!("Android screen, fix quality:{}", fix);
+        base_bitrate = base_bitrate * fix;
+    }
+    base_bitrate
+}
+
+pub fn codec_thread_num() -> usize {
+    let max: usize = num_cpus::get();
+    let mut res;
+    let info;
+    #[cfg(windows)]
+    {
+        res = 0;
+        let percent = hbb_common::platform::windows::cpu_uage_one_minute();
+        info = format!("cpu usage:{:?}", percent);
+        if let Some(pecent) = percent {
+            if pecent < 100.0 {
+                res = ((100.0 - pecent) * (max as f64) / 200.0).round() as usize;
             }
         }
     }
-
-    #[inline]
-    pub fn data(&self) -> (&[u8], &[u8], &[u8]) {
-        unsafe {
-            let img = self.inner();
-            let h = (img.d_h as usize + 1) & !1;
-            let n = img.stride[0] as usize * h;
-            let y = slice::from_raw_parts(img.planes[0], n);
-            let n = img.stride[1] as usize * (h >> 1);
-            let u = slice::from_raw_parts(img.planes[1], n);
-            let v = slice::from_raw_parts(img.planes[2], n);
-            (y, u, v)
-        }
+    #[cfg(not(windows))]
+    {
+        let s = System::new_all();
+        // https://man7.org/linux/man-pages/man3/getloadavg.3.html
+        let avg = s.load_average();
+        info = format!("cpu loadavg:{}", avg.one);
+        res = (((max as f64) - avg.one) * 0.5).round() as usize;
     }
-}
-
-impl Drop for Image {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { vpx_img_free(self.0) };
-        }
+    res = std::cmp::min(res, max / 2);
+    if res == 0 {
+        res = 1;
     }
+    // avoid frequent log
+    let log = match THREAD_LOG_TIME.lock().unwrap().clone() {
+        Some(instant) => instant.elapsed().as_secs() > 1,
+        None => true,
+    };
+    if log {
+        log::info!("cpu num:{max}, {info}, codec thread:{res}");
+        *THREAD_LOG_TIME.lock().unwrap() = Some(Instant::now());
+    }
+    res
 }
-
-unsafe impl Send for vpx_codec_ctx_t {}

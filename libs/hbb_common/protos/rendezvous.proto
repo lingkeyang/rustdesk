@@ -18,13 +18,16 @@ message RegisterPeerResponse { bool request_pk = 2; }
 message PunchHoleRequest { 
   string id = 1; 
   NatType nat_type = 2;
+  string licence_key = 3;
   ConnType conn_type = 4;
+  string token = 5;
 }
 
 message PunchHole { 
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
+  string request_region = 4;
 }
 
 message TestNatRequest {
@@ -48,17 +51,20 @@ message PunchHoleSent {
   string id = 2;
   string relay_server = 3;
   NatType nat_type = 4;
+  string version = 5;
+  string request_region = 6;
 }
 
 message RegisterPk {
   string id = 1;
   bytes uuid = 2;
   bytes pk = 3;
+  string old_id = 4;
 }
 
 message RegisterPkResponse {
   enum Result {
-    OK = 1;
+    OK = 0;
     UUID_MISMATCH = 2;
     ID_EXISTS = 3;
     TOO_FREQUENT = 4;
@@ -73,10 +79,10 @@ message PunchHoleResponse {
   bytes socket_addr = 1;
   bytes pk = 2;
   enum Failure {
-    ID_NOT_EXIST = 1;
+    ID_NOT_EXIST = 0;
     OFFLINE = 2;
-    LICENCE_MISMATCH = 3;
-    LICENCE_OVERUSE = 4;
+    LICENSE_MISMATCH = 3;
+    LICENSE_OVERUSE = 4;
   }
   Failure failure = 3;
   string relay_server = 4;
@@ -98,7 +104,10 @@ message RequestRelay {
   bytes socket_addr = 3;
   string relay_server = 4;
   bool secure = 5;
+  string licence_key = 6;
   ConnType conn_type = 7;
+  string token = 8;
+  string request_region = 9;
 }
 
 message RelayResponse {
@@ -110,6 +119,8 @@ message RelayResponse {
     bytes pk = 5;
   }
   string refuse_reason = 6;
+  string version = 7;
+  string request_region = 8;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -121,6 +132,7 @@ message SoftwareUpdate { string url = 1; }
 message FetchLocalAddr { 
   bytes socket_addr = 1; 
   string relay_server = 2;
+  string request_region = 3;
 }
 
 message LocalAddr {
@@ -128,6 +140,31 @@ message LocalAddr {
   bytes local_addr = 2;
   string relay_server = 3;
   string id = 4;
+  string version = 5;
+  string request_region = 6;
+}
+
+message PeerDiscovery {
+  string cmd = 1;
+  string mac = 2;
+  string id = 3;
+  string username = 4;
+  string hostname = 5;
+  string platform = 6;
+  string misc = 7;
+}
+
+message OnlineRequest {
+  string id = 1;
+  repeated string peers = 2;
+}
+
+message OnlineResponse {
+  bytes states = 1;
+}
+
+message KeyExchange {
+  repeated bytes keys = 1; 
 }
 
 message RendezvousMessage {
@@ -148,5 +185,9 @@ message RendezvousMessage {
     RelayResponse relay_response = 19;
     TestNatRequest test_nat_request = 20;
     TestNatResponse test_nat_response = 21;
+    PeerDiscovery peer_discovery = 22;
+    OnlineRequest online_request = 23;
+    OnlineResponse online_response = 24;
+    KeyExchange key_exchange = 25;
   }
 }
